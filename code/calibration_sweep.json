@@ -2,5 +2,5 @@
   "thresholds": [8, 9, 10],
   "match_score": 0.2,
   "well_detected_score": 0.8,
-  "expected_duration_s": 300.0
+  "expected_duration_s": 1200.0
 }
