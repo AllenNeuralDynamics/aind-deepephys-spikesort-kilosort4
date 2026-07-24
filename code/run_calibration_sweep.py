@@ -50,9 +50,7 @@ def _single_path(paths: list[Path], description: str) -> Path:
 
 def discover_inputs(data_folder: Path) -> tuple[Path, Path]:
     recording_candidates = sorted(
-        path.parent
-        for path in data_folder.rglob("si_folder.json")
-        if "denoised" in path.parent.name.lower()
+        path.parent for path in data_folder.rglob("si_folder.json")
     )
     gt_candidates = sorted(data_folder.rglob("sorting.zarr"))
     return (
