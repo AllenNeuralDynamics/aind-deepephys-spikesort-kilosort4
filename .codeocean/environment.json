@@ -4,7 +4,7 @@
 	"options": {
 		"registry_host_arg": true,
 		"git_ask_pass": false,
-		"mount_secrets": true
+		"mount_secrets": false
 	},
 	"installers": {
 		"pip": {
