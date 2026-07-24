@@ -3,7 +3,7 @@
 	"base_image": "codeocean/kilosort4-base:4.1.7_cuda-12.0.0",
 	"options": {
 		"registry_host_arg": true,
-		"git_ask_pass": true,
+		"git_ask_pass": false,
 		"mount_secrets": true
 	},
 	"installers": {
