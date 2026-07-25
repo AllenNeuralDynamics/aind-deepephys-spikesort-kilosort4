@@ -74,6 +74,19 @@ def load_sweep_config() -> dict:
     if len(set(thresholds)) != len(thresholds):
         raise ValueError(f"thresholds must be unique: {thresholds}")
     config["thresholds"] = thresholds
+    duration_keys = [
+        key
+        for key in ("expected_duration_s", "minimum_duration_s")
+        if key in config
+    ]
+    if len(duration_keys) != 1:
+        raise ValueError(
+            "configure exactly one of expected_duration_s or minimum_duration_s"
+        )
+    duration_key = duration_keys[0]
+    config[duration_key] = float(config[duration_key])
+    if config[duration_key] <= 0:
+        raise ValueError(f"{duration_key} must be positive")
     return config
 
 
@@ -128,10 +141,21 @@ def main() -> None:
     if recording.get_num_segments() != 1:
         raise ValueError("calibration recording must have one segment")
     duration_s = recording.get_total_duration()
-    expected_duration_s = float(config["expected_duration_s"])
-    if not np.isclose(duration_s, expected_duration_s, atol=1 / recording.sampling_frequency):
+    if "expected_duration_s" in config:
+        expected_duration_s = config["expected_duration_s"]
+        if not np.isclose(
+            duration_s,
+            expected_duration_s,
+            atol=1 / recording.sampling_frequency,
+        ):
+            raise ValueError(
+                f"unexpected recording duration: {duration_s} != "
+                f"{expected_duration_s}"
+            )
+    elif duration_s < config["minimum_duration_s"]:
         raise ValueError(
-            f"unexpected recording duration: {duration_s} != {expected_duration_s}"
+            f"recording is too short: {duration_s} < "
+            f"{config['minimum_duration_s']}"
         )
 
     gt_sorting = si.read_zarr(gt_folder)
