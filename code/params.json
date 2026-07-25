@@ -7,7 +7,7 @@
         "batch_size": 60000,
         "nblocks": 5,
         "Th_universal": 9,
-        "Th_learned": 8,
+        "Th_learned": 9,
         "do_CAR": true,
         "invert_sign": false,
         "nt": 61,
