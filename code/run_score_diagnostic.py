@@ -880,42 +880,77 @@ def run_event_lineage(
     }
 
 
-def align_replay_peels(st: np.ndarray, replay: dict) -> np.ndarray:
-    """Attach independently replayed peel IDs to Kilosort extraction events."""
+def align_replay_peels(st: np.ndarray, replay: dict) -> tuple[np.ndarray, dict]:
+    """Attach replayed peel IDs using exact event-key multiplicities."""
     replay_scores = replay["scores"].astype(np.float32)
-    replay_keys = list(
-        zip(
+    replay_keys = np.column_stack(
+        (
             replay["events"].astype(np.int64),
             replay["templates"].astype(np.int64),
         )
     )
-    peel_by_key = {}
-    for key, score, peel in zip(replay_keys, replay_scores, replay["peels"]):
-        peel_by_key.setdefault(key, []).append((float(score), int(peel)))
     extracted_scores = st[:, 2].astype(np.float32)
-    extracted_keys = zip(
-        st[:, 0].astype(np.int64),
-        st[:, 1].astype(np.int64),
-    )
-    peels = np.empty(st.shape[0], dtype=np.int16)
-    for index, (key, score) in enumerate(zip(extracted_keys, extracted_scores)):
-        candidates = peel_by_key.get(key, [])
-        if not candidates:
-            raise RuntimeError(f"extracted event absent from replay: {key}")
-        differences = np.abs(
-            np.asarray([candidate[0] for candidate in candidates]) - float(score)
+    extracted_keys = np.column_stack(
+        (
+            st[:, 0].astype(np.int64),
+            st[:, 1].astype(np.int64),
         )
-        match_index = int(np.argmin(differences))
-        if not np.isclose(
-            candidates[match_index][0], float(score), rtol=1e-6, atol=1e-6
-        ):
+    )
+    replay_by_key = {}
+    for index, key in enumerate(map(tuple, replay_keys)):
+        replay_by_key.setdefault(key, []).append(index)
+    extracted_by_key = {}
+    for index, key in enumerate(map(tuple, extracted_keys)):
+        extracted_by_key.setdefault(key, []).append(index)
+    if replay_by_key.keys() != extracted_by_key.keys():
+        missing = sorted(extracted_by_key.keys() - replay_by_key.keys())[:10]
+        extra = sorted(replay_by_key.keys() - extracted_by_key.keys())[:10]
+        raise RuntimeError(
+            f"replay/extraction event keys differ; missing={missing}, extra={extra}"
+        )
+
+    peels = np.empty(st.shape[0], dtype=np.int16)
+    aligned_replay_scores = np.empty(st.shape[0], dtype=np.float32)
+    score_differences = np.empty(st.shape[0], dtype=np.float32)
+    duplicate_events = 0
+    for key, extracted_indices in extracted_by_key.items():
+        replay_indices = replay_by_key[key]
+        if len(extracted_indices) != len(replay_indices):
             raise RuntimeError(
-                f"extracted event score differs from replay: {key}, {score}"
+                "replay/extraction event multiplicity differs for "
+                f"{key}: {len(replay_indices)} != {len(extracted_indices)}"
             )
-        _, peels[index] = candidates.pop(match_index)
-    if any(candidates for candidates in peel_by_key.values()):
-        raise RuntimeError("replay contains events absent from exact extraction")
-    return peels
+        if len(extracted_indices) > 1:
+            duplicate_events += len(extracted_indices)
+        extracted_order = np.asarray(extracted_indices)[
+            np.argsort(extracted_scores[extracted_indices], kind="stable")
+        ]
+        replay_order = np.asarray(replay_indices)[
+            np.argsort(replay_scores[replay_indices], kind="stable")
+        ]
+        peels[extracted_order] = replay["peels"][replay_order]
+        aligned_replay_scores[extracted_order] = replay_scores[replay_order]
+        score_differences[extracted_order] = np.abs(
+            extracted_scores[extracted_order]
+            - aligned_replay_scores[extracted_order]
+        )
+    close = np.isclose(
+        extracted_scores,
+        aligned_replay_scores,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    summary = {
+        "events": int(st.shape[0]),
+        "event_keys": int(len(extracted_by_key)),
+        "events_in_duplicate_keys": int(duplicate_events),
+        "score_close_events": int(close.sum()),
+        "score_different_events": int((~close).sum()),
+        "score_abs_difference_mean": float(score_differences.mean()),
+        "score_abs_difference_max": float(score_differences.max()),
+        "score_abs_difference_q99": float(np.quantile(score_differences, 0.99)),
+    }
+    return peels, summary
 
 
 def replay_domain(
@@ -1233,6 +1268,7 @@ def replay_domain(
                 }
             )
     lineage_outputs = []
+    lineage_alignment_rows = []
     for threshold in LINEAGE_THRESHOLDS:
         print(f"[{domain}] exact lineage at Th_learned={threshold:g}", flush=True)
         lineage_ops = ops.copy()
@@ -1241,7 +1277,9 @@ def replay_domain(
         st, tF, lineage_ops = template_matching.extract(
             lineage_ops, bfile, U, device=device
         )
-        peels = align_replay_peels(st, threshold_matches[threshold])
+        peels, alignment = align_replay_peels(st, threshold_matches[threshold])
+        alignment.update({"domain": domain, "Th_learned": threshold})
+        lineage_alignment_rows.append(alignment)
         lineage_outputs.append(
             run_event_lineage(
                 domain,
@@ -1295,6 +1333,7 @@ def replay_domain(
         "lineage_scores": [
             row for output in lineage_outputs for row in output["lineage_scores"]
         ],
+        "lineage_alignment": lineage_alignment_rows,
     }
 
 
@@ -1449,6 +1488,7 @@ def main() -> None:
         ),
         ("lineage_stage_deltas", "event_lineage_stage_deltas.csv"),
         ("lineage_scores", "event_lineage_score_summary.csv"),
+        ("lineage_alignment", "event_lineage_replay_alignment.csv"),
     ):
         pd.DataFrame([row for output in outputs for row in output[key]]).to_csv(
             RESULTS / filename, index=False
