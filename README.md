@@ -101,3 +101,38 @@ The output of this capsule is the following:
 - `results/spikesorted_{recording_name}` folder, containing the spike sorted data saved by SpikeInterface and the spike sorting log
 - `results/data_process_spikesorting_{recording_name}.json` file, a JSON file containing a `DataProcess` object from the [aind-data-schema](https://aind-data-schema.readthedocs.io/en/stable/) package.
 
+### Fixed-template score diagnostic
+
+The owned calibration capsule also supports an explicit diagnostic entry point:
+
+```bash
+./run --score-diagnostic
+```
+
+This mode expects the exact 1,200-second denoised input mounted as
+`full96_om1_probec_1200s` and the corresponding raw/ground-truth asset mounted as
+`probec_recording1_3`. It learns templates once from the denoised input, then
+replays the same templates, whitening, drift, and channel selection on matched
+raw and denoised samples.
+
+Score replay covers `Th_learned` 8, 9, 10, and 10.75. Full event lineage is
+recorded at the endpoint thresholds 8 and 10.75 across these stages:
+
+1. learned detection template;
+2. final graph clustering;
+3. CCG-guided cluster merging;
+4. duplicate removal.
+
+The lineage CSVs report stage totals, per-GT-unit counts, per-cluster properties,
+adjacent-stage deltas, status transitions, detection-template-to-cluster
+transitions, and extraction-score distributions. Compressed NPZ files preserve
+the complete event identity and status arrays. Event status uses the benchmark
+matching settings: 0.4 ms tolerance, Hungarian unit matching, and minimum
+agreement 0.2.
+
+`fp_matched_cluster` means an event in a sorter cluster matched to an injected
+GT unit but not temporally matched to that unit. It is not necessarily electrical
+noise; native biological spikes can receive this benchmark label. The lineage is
+a controlled fixed-denoised-template experiment, not an independently relearned
+production sort for each input domain.
+

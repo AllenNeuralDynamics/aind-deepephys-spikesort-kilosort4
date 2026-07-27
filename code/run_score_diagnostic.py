@@ -27,6 +27,9 @@ DENOISED_MOUNT = "full96_om1_probec_1200s"
 EXPECTED_DURATION_S = 1200.0
 TEMPLATE_LEARNING_THRESHOLD = 8.0
 THRESHOLDS = (8.0, 9.0, 10.0, 10.75)
+LINEAGE_THRESHOLDS = (8.0, 10.75)
+LINEAGE_DELTA_TIME_MS = 0.4
+LINEAGE_MATCH_SCORE = 0.2
 GT_SAMPLES_PER_UNIT = 256
 BACKGROUND_SAMPLES = 4096
 MATCH_TOLERANCE_SAMPLES = 6
@@ -35,6 +38,12 @@ SEED = 0
 SCORE_EDGES = np.concatenate(
     [np.arange(0, 20.1, 0.1), np.array([25.0, 30.0, 40.0, np.inf])]
 )
+STATUS_NAMES = {
+    0: "unmatched_cluster",
+    1: "fp_matched_cluster",
+    2: "tp",
+    3: "removed_by_dedup",
+}
 BAD_CHANNEL_KWARGS = {
     "method": "coherence+psd",
     "dead_channel_threshold": -0.5,
@@ -197,7 +206,6 @@ def simulate_matching(
 ) -> dict[str, torch.Tensor]:
     """Run the exact 4.1.7 matching-pursuit decisions without feature export."""
     nt = ops["nt"]
-    W = ops["wPCA"].contiguous()
     nm = (U**2).sum(-1).sum(-1)
     B = B_initial.clone()
     trange = torch.arange(-nt, nt + 1, device=B.device)
@@ -323,6 +331,593 @@ def replay_frame_bounds(ops: dict, n_samples: int) -> tuple[int, int]:
     return start, stop
 
 
+def is_matched_unit(unit_id) -> bool:
+    return unit_id != -1 and unit_id != ""
+
+
+def canonicalize_labels(labels: np.ndarray) -> np.ndarray:
+    """Relabel clusters by first occurrence for partition comparison."""
+    canonical = np.empty(labels.size, dtype=np.int64)
+    mapping = {}
+    for index, label in enumerate(labels):
+        if int(label) not in mapping:
+            mapping[int(label)] = len(mapping)
+        canonical[index] = mapping[int(label)]
+    return canonical
+
+
+def evaluate_lineage_stage(
+    domain: str,
+    threshold: float,
+    stage: str,
+    times: np.ndarray,
+    labels: np.ndarray,
+    event_ids: np.ndarray,
+    total_events: int,
+    gt_sorting: si.BaseSorting,
+    sampling_frequency: float,
+    all_gt_frames: np.ndarray,
+    acg_threshold: float,
+    ccg_threshold: float,
+    detection_templates: np.ndarray,
+) -> dict:
+    """Apply benchmark unit matching and assign every event a stage status."""
+    import spikeinterface.comparison as sc
+    from kilosort import CCG
+
+    if not (times.size == labels.size == event_ids.size):
+        raise ValueError(f"{stage} lineage arrays differ in length")
+    if np.unique(event_ids).size != event_ids.size:
+        raise ValueError(f"{stage} lineage event IDs are not unique")
+    tested_sorting = si.NumpySorting.from_samples_and_labels(
+        times.astype(np.int64),
+        labels.astype(np.int32),
+        sampling_frequency=sampling_frequency,
+    )
+    comparison = sc.compare_sorter_to_ground_truth(
+        gt_sorting,
+        tested_sorting,
+        exhaustive_gt=False,
+        delta_time=LINEAGE_DELTA_TIME_MS,
+        match_score=LINEAGE_MATCH_SCORE,
+        compute_labels=True,
+    )
+    expected_delta_frames = int(
+        LINEAGE_DELTA_TIME_MS / 1000 * sampling_frequency
+    )
+    if comparison.delta_frames != expected_delta_frames:
+        raise RuntimeError(
+            "SpikeInterface comparison tolerance differs from benchmark "
+            f"expectation: {comparison.delta_frames} != {expected_delta_frames}"
+        )
+    counts = comparison.get_performance(method="raw_count", output="pandas")
+    performance = comparison.get_performance(method="by_unit", output="pandas")
+
+    status = np.full(total_events, 3, dtype=np.int8)
+    status[event_ids] = 0
+    assigned_gt = np.full(total_events, -1, dtype=np.int64)
+    reverse_match = comparison.hungarian_match_21
+    sorted_event_indices = np.argsort(times)
+    for cluster_id in tested_sorting.unit_ids:
+        cluster_indices = sorted_event_indices[labels[sorted_event_indices] == cluster_id]
+        ordered_event_ids = event_ids[cluster_indices]
+        gt_unit_id = reverse_match[cluster_id]
+        if not is_matched_unit(gt_unit_id):
+            continue
+        assigned_gt[ordered_event_ids] = int(gt_unit_id)
+        event_labels = comparison.get_labels2(cluster_id)[0]
+        if event_labels.size != ordered_event_ids.size:
+            raise RuntimeError(f"{stage} SpikeInterface labels lost event identity")
+        status[ordered_event_ids] = 1
+        status[ordered_event_ids[event_labels == "TP"]] = 2
+
+    spike_vector = tested_sorting.to_spike_vector()
+    is_refractory, contamination = CCG.refract(
+        spike_vector["unit_index"],
+        spike_vector["sample_index"] / sampling_frequency,
+        acg_threshold=acg_threshold,
+        ccg_threshold=ccg_threshold,
+    )
+    cluster_to_index = {
+        int(cluster_id): index
+        for index, cluster_id in enumerate(tested_sorting.unit_ids)
+    }
+    cluster_rows = []
+    for cluster_id in tested_sorting.unit_ids:
+        cluster_mask = labels == cluster_id
+        cluster_event_ids = event_ids[cluster_mask]
+        cluster_times = times[cluster_mask]
+        cluster_index = cluster_to_index[int(cluster_id)]
+        assigned = np.unique(assigned_gt[cluster_event_ids])
+        if assigned.size != 1:
+            raise RuntimeError(f"{stage} cluster has inconsistent GT assignment")
+        source_templates, source_counts = np.unique(
+            detection_templates[cluster_event_ids], return_counts=True
+        )
+        dominant_index = int(np.argmax(source_counts))
+        proximal, _ = match_events_one_to_one(
+            cluster_times.astype(np.int64), all_gt_frames, comparison.delta_frames
+        )
+        cluster_rows.append(
+            {
+                "domain": domain,
+                "Th_learned": threshold,
+                "stage": stage,
+                "cluster_id": int(cluster_id),
+                "assigned_gt_unit_id": int(assigned[0]),
+                "events": int(cluster_event_ids.size),
+                "detection_templates": int(source_templates.size),
+                "dominant_detection_template": int(
+                    source_templates[dominant_index]
+                ),
+                "dominant_detection_template_fraction": float(
+                    source_counts[dominant_index] / cluster_event_ids.size
+                ),
+                "tp": int((status[cluster_event_ids] == 2).sum()),
+                "fp_if_matched": int((status[cluster_event_ids] == 1).sum()),
+                "gt_proximal_events_any_unit": int(proximal.size),
+                "gt_negative_events_any_unit": int(
+                    cluster_event_ids.size - proximal.size
+                ),
+                "is_refractory": int(is_refractory[cluster_index]),
+                "contamination": float(contamination[cluster_index]),
+            }
+        )
+    unit_rows = []
+    for gt_unit_id in gt_sorting.unit_ids:
+        cluster_id = counts.at[gt_unit_id, "tested_id"]
+        matched = is_matched_unit(cluster_id)
+        cluster_index = cluster_to_index[int(cluster_id)] if matched else None
+        agreement = (
+            comparison.agreement_scores.at[gt_unit_id, cluster_id]
+            if matched
+            else 0.0
+        )
+        unit_rows.append(
+            {
+                "domain": domain,
+                "Th_learned": threshold,
+                "stage": stage,
+                "gt_unit_id": int(gt_unit_id),
+                "cluster_id": int(cluster_id) if matched else -1,
+                "agreement": float(agreement),
+                "tp": int(counts.at[gt_unit_id, "tp"]),
+                "fn": int(counts.at[gt_unit_id, "fn"]),
+                "fp": int(counts.at[gt_unit_id, "fp"]),
+                "num_gt": int(counts.at[gt_unit_id, "num_gt"]),
+                "num_tested": int(counts.at[gt_unit_id, "num_tested"]),
+                "accuracy": float(performance.at[gt_unit_id, "accuracy"]),
+                "precision": float(performance.at[gt_unit_id, "precision"]),
+                "recall": float(performance.at[gt_unit_id, "recall"]),
+                "cluster_is_refractory": (
+                    int(is_refractory[cluster_index]) if matched else np.nan
+                ),
+                "cluster_contamination": (
+                    float(contamination[cluster_index]) if matched else np.nan
+                ),
+            }
+        )
+
+    event_match, _ = match_events_one_to_one(
+        times.astype(np.int64), all_gt_frames, comparison.delta_frames
+    )
+    gt_proximal = np.zeros(total_events, dtype=bool)
+    gt_proximal[event_ids[event_match]] = True
+    tp = int((status == 2).sum())
+    fp = int((status == 1).sum())
+    fn = int(counts["fn"].astype(np.int64).sum())
+    if tp != int(counts["tp"].astype(np.int64).sum()):
+        raise RuntimeError(f"{stage} event TP labels disagree with count table")
+    if fp != int(counts["fp"].astype(np.int64).sum()):
+        raise RuntimeError(f"{stage} event FP labels disagree with count table")
+    if int((status != 3).sum()) != times.size:
+        raise RuntimeError(f"{stage} present-event status count is inconsistent")
+    summary = {
+        "domain": domain,
+        "Th_learned": threshold,
+        "stage": stage,
+        "events_present": int(times.size),
+        "events_removed": int(total_events - times.size),
+        "clusters": int(tested_sorting.get_num_units()),
+        "matched_gt_units": int(
+            sum(is_matched_unit(value) for value in comparison.hungarian_match_12)
+        ),
+        "tp": tp,
+        "fn": fn,
+        "fp_in_matched_clusters": fp,
+        "events_in_unmatched_clusters": int((status == 0).sum()),
+        "pooled_precision": tp / (tp + fp) if tp + fp else 0.0,
+        "pooled_recall": tp / (tp + fn) if tp + fn else 0.0,
+        "gt_proximal_events_any_unit": int(event_match.size),
+        "gt_negative_events_any_unit": int(times.size - event_match.size),
+    }
+    return {
+        "summary": summary,
+        "units": unit_rows,
+        "clusters": cluster_rows,
+        "status": status,
+        "assigned_gt": assigned_gt,
+        "gt_proximal": gt_proximal,
+    }
+
+
+def lineage_score_rows(
+    domain: str,
+    threshold: float,
+    stage: str,
+    status: np.ndarray,
+    scores: np.ndarray,
+    peels: np.ndarray,
+) -> list[dict]:
+    """Summarize original extraction scores by downstream event status."""
+    rows = []
+    for status_code, status_name in STATUS_NAMES.items():
+        for peel in range(int(peels.max()) + 1):
+            selected = (status == status_code) & (peels == peel)
+            values = scores[selected]
+            if not values.size:
+                continue
+            rows.append(
+                {
+                    "domain": domain,
+                    "Th_learned": threshold,
+                    "stage": stage,
+                    "status": status_name,
+                    "peel": peel,
+                    "events": int(values.size),
+                    "score_mean": float(values.mean()),
+                    "score_q10": float(np.quantile(values, 0.1)),
+                    "score_median": float(np.median(values)),
+                    "score_q90": float(np.quantile(values, 0.9)),
+                }
+            )
+    return rows
+
+
+def run_event_lineage(
+    domain: str,
+    threshold: float,
+    ops: dict,
+    st: np.ndarray,
+    tF: torch.Tensor,
+    peels: np.ndarray,
+    gt_sorting: si.BaseSorting,
+    sampling_frequency: float,
+    imin: int,
+    final_reference: dict | None = None,
+) -> dict[str, list[dict]]:
+    """Trace extracted events through clustering, merging, and deduplication."""
+    from kilosort import clustering_qr, postprocessing, template_matching
+
+    event_count = st.shape[0]
+    if not (event_count == tF.shape[0] == peels.size):
+        raise ValueError("extracted event lineage arrays differ in length")
+    event_ids = np.arange(event_count, dtype=np.int64)
+    detection_times = st[:, 0].astype(np.int64) + int(imin)
+    detection_templates = st[:, 1].astype(np.int32)
+    detection_scores = st[:, 2].astype(np.float32)
+    all_gt_frames = np.sort(
+        np.concatenate(
+            [
+                gt_sorting.get_unit_spike_train(unit_id, segment_index=0)
+                for unit_id in gt_sorting.unit_ids
+            ]
+        ).astype(np.int64)
+    )
+
+    stages = []
+    stages.append(
+        (
+            "detection_template",
+            evaluate_lineage_stage(
+                domain,
+                threshold,
+                "detection_template",
+                detection_times,
+                detection_templates,
+                event_ids,
+                event_count,
+                gt_sorting,
+                sampling_frequency,
+                all_gt_frames,
+                float(ops["settings"]["acg_threshold"]),
+                float(ops["settings"]["ccg_threshold"]),
+                detection_templates,
+            ),
+        )
+    )
+
+    premerge_clusters, Wall = clustering_qr.run(
+        ops, st, tF, mode="template", device=torch.device("cuda")
+    )
+    stages.append(
+        (
+            "final_clustering",
+            evaluate_lineage_stage(
+                domain,
+                threshold,
+                "final_clustering",
+                detection_times,
+                premerge_clusters,
+                event_ids,
+                event_count,
+                gt_sorting,
+                sampling_frequency,
+                all_gt_frames,
+                float(ops["settings"]["acg_threshold"]),
+                float(ops["settings"]["ccg_threshold"]),
+                detection_templates,
+            ),
+        )
+    )
+
+    st_with_ids = np.column_stack((st, event_ids))
+    _, merged_clusters, _, merged_st, _ = template_matching.merging_function(
+        ops,
+        Wall,
+        premerge_clusters,
+        st_with_ids,
+        tF,
+        device=torch.device("cuda"),
+    )
+    merged_event_ids = merged_st[:, 3].astype(np.int64)
+    if not np.array_equal(np.sort(merged_event_ids), event_ids):
+        raise RuntimeError("merging changed the event identity set")
+    merged_times = np.empty(event_count, dtype=np.int64)
+    merged_labels = np.empty(event_count, dtype=np.int32)
+    merged_times[merged_event_ids] = (
+        merged_st[:, 0].astype(np.int64) + int(imin)
+    )
+    merged_labels[merged_event_ids] = merged_clusters.astype(np.int32)
+    stages.append(
+        (
+            "cluster_merging",
+            evaluate_lineage_stage(
+                domain,
+                threshold,
+                "cluster_merging",
+                merged_times,
+                merged_labels,
+                event_ids,
+                event_count,
+                gt_sorting,
+                sampling_frequency,
+                all_gt_frames,
+                float(ops["settings"]["acg_threshold"]),
+                float(ops["settings"]["ccg_threshold"]),
+                detection_templates,
+            ),
+        )
+    )
+
+    dedup_times, dedup_labels, keep_sorted = postprocessing.remove_duplicates(
+        merged_st[:, 0].astype(np.int64) + int(imin),
+        merged_clusters.astype(np.int32),
+        dt=np.int32(ops["duplicate_spike_bins"]),
+    )
+    kept_event_ids = merged_event_ids[keep_sorted]
+    kept = np.zeros(event_count, dtype=bool)
+    kept[kept_event_ids] = True
+    stages.append(
+        (
+            "duplicate_removal",
+            evaluate_lineage_stage(
+                domain,
+                threshold,
+                "duplicate_removal",
+                dedup_times,
+                dedup_labels,
+                kept_event_ids,
+                event_count,
+                gt_sorting,
+                sampling_frequency,
+                all_gt_frames,
+                float(ops["settings"]["acg_threshold"]),
+                float(ops["settings"]["ccg_threshold"]),
+                detection_templates,
+            ),
+        )
+    )
+    if final_reference is not None:
+        reference_times = final_reference["times"].astype(np.int64)
+        reference_labels = final_reference["labels"].astype(np.int64)
+        if not np.array_equal(dedup_times, reference_times):
+            raise RuntimeError("lineage final times differ from template-learning sort")
+        if not np.array_equal(
+            canonicalize_labels(dedup_labels), canonicalize_labels(reference_labels)
+        ):
+            raise RuntimeError(
+                "lineage final cluster partition differs from template-learning sort"
+            )
+        stages[-1][1]["summary"]["template_learning_sort_identity"] = "exact"
+
+    transition_rows = []
+    cluster_transition_rows = []
+    stage_delta_rows = []
+    score_rows = []
+    for stage_name, result in stages:
+        score_rows.extend(
+            lineage_score_rows(
+                domain,
+                threshold,
+                stage_name,
+                result["status"],
+                detection_scores,
+                peels,
+            )
+        )
+    for (from_name, from_result), (to_name, to_result) in zip(stages, stages[1:]):
+        from_summary = from_result["summary"]
+        to_summary = to_result["summary"]
+        stage_delta_rows.append(
+            {
+                "domain": domain,
+                "Th_learned": threshold,
+                "from_stage": from_name,
+                "to_stage": to_name,
+                "event_delta": (
+                    to_summary["events_present"] - from_summary["events_present"]
+                ),
+                "cluster_delta": to_summary["clusters"] - from_summary["clusters"],
+                "matched_gt_unit_delta": (
+                    to_summary["matched_gt_units"]
+                    - from_summary["matched_gt_units"]
+                ),
+                "tp_delta": to_summary["tp"] - from_summary["tp"],
+                "fn_delta": to_summary["fn"] - from_summary["fn"],
+                "fp_in_matched_clusters_delta": (
+                    to_summary["fp_in_matched_clusters"]
+                    - from_summary["fp_in_matched_clusters"]
+                ),
+                "events_in_unmatched_clusters_delta": (
+                    to_summary["events_in_unmatched_clusters"]
+                    - from_summary["events_in_unmatched_clusters"]
+                ),
+                "gt_negative_events_any_unit_delta": (
+                    to_summary["gt_negative_events_any_unit"]
+                    - from_summary["gt_negative_events_any_unit"]
+                ),
+            }
+        )
+        for from_code, from_status in STATUS_NAMES.items():
+            for to_code, to_status in STATUS_NAMES.items():
+                count = int(
+                    (
+                        (from_result["status"] == from_code)
+                        & (to_result["status"] == to_code)
+                    ).sum()
+                )
+                if count:
+                    transition_rows.append(
+                        {
+                            "domain": domain,
+                            "Th_learned": threshold,
+                            "from_stage": from_name,
+                            "to_stage": to_name,
+                            "from_status": from_status,
+                            "to_status": to_status,
+                            "events": count,
+                        }
+                    )
+
+    dedup_labels_by_event = np.full(event_count, -1, dtype=np.int32)
+    dedup_labels_by_event[kept_event_ids] = dedup_labels
+    stage_cluster_labels = [
+        ("detection_template", detection_templates),
+        ("final_clustering", premerge_clusters.astype(np.int32)),
+        ("cluster_merging", merged_labels),
+        ("duplicate_removal", dedup_labels_by_event),
+    ]
+    for (
+        (from_name, from_labels),
+        (to_name, to_labels),
+        (_, from_result),
+        (_, to_result),
+    ) in zip(
+        stage_cluster_labels,
+        stage_cluster_labels[1:],
+        stages,
+        stages[1:],
+    ):
+        transitions = np.column_stack(
+            (
+                from_labels,
+                to_labels,
+                from_result["status"],
+                to_result["status"],
+            )
+        )
+        unique_transitions, transition_counts = np.unique(
+            transitions, axis=0, return_counts=True
+        )
+        for values, count in zip(unique_transitions, transition_counts):
+            from_cluster, to_cluster, from_status, to_status = values
+            cluster_transition_rows.append(
+                {
+                    "domain": domain,
+                    "Th_learned": threshold,
+                    "from_stage": from_name,
+                    "to_stage": to_name,
+                    "from_cluster": int(from_cluster),
+                    "to_cluster": int(to_cluster),
+                    "from_status": STATUS_NAMES[int(from_status)],
+                    "to_status": STATUS_NAMES[int(to_status)],
+                    "events": int(count),
+                }
+            )
+
+    archive = {
+        "event_id": event_ids,
+        "detection_time": detection_times,
+        "postmerge_time": merged_times,
+        "detection_template": detection_templates,
+        "detection_score": detection_scores,
+        "detection_peel": peels.astype(np.int16),
+        "premerge_cluster": premerge_clusters.astype(np.int32),
+        "postmerge_cluster": merged_labels,
+        "kept_after_dedup": kept,
+    }
+    for stage_name, result in stages:
+        archive[f"{stage_name}_status"] = result["status"]
+        archive[f"{stage_name}_assigned_gt"] = result["assigned_gt"]
+        archive[f"{stage_name}_gt_proximal"] = result["gt_proximal"]
+    threshold_name = str(threshold).replace(".", "p")
+    np.savez_compressed(
+        RESULTS / f"event_lineage_{domain}_Th_{threshold_name}.npz", **archive
+    )
+    return {
+        "lineage_stages": [result["summary"] for _, result in stages],
+        "lineage_units": [
+            row for _, result in stages for row in result["units"]
+        ],
+        "lineage_clusters": [
+            row for _, result in stages for row in result["clusters"]
+        ],
+        "lineage_transitions": transition_rows,
+        "lineage_cluster_transitions": cluster_transition_rows,
+        "lineage_stage_deltas": stage_delta_rows,
+        "lineage_scores": score_rows,
+    }
+
+
+def align_replay_peels(st: np.ndarray, replay: dict) -> np.ndarray:
+    """Attach independently replayed peel IDs to Kilosort extraction events."""
+    replay_scores = replay["scores"].astype(np.float32)
+    replay_keys = list(
+        zip(
+            replay["events"].astype(np.int64),
+            replay["templates"].astype(np.int64),
+        )
+    )
+    peel_by_key = {}
+    for key, score, peel in zip(replay_keys, replay_scores, replay["peels"]):
+        peel_by_key.setdefault(key, []).append((float(score), int(peel)))
+    extracted_scores = st[:, 2].astype(np.float32)
+    extracted_keys = zip(
+        st[:, 0].astype(np.int64),
+        st[:, 1].astype(np.int64),
+    )
+    peels = np.empty(st.shape[0], dtype=np.int16)
+    for index, (key, score) in enumerate(zip(extracted_keys, extracted_scores)):
+        candidates = peel_by_key.get(key, [])
+        if not candidates:
+            raise RuntimeError(f"extracted event absent from replay: {key}")
+        differences = np.abs(
+            np.asarray([candidate[0] for candidate in candidates]) - float(score)
+        )
+        match_index = int(np.argmin(differences))
+        if not np.isclose(
+            candidates[match_index][0], float(score), rtol=1e-6, atol=1e-6
+        ):
+            raise RuntimeError(
+                f"extracted event score differs from replay: {key}, {score}"
+            )
+        _, peels[index] = candidates.pop(match_index)
+    if any(candidates for candidates in peel_by_key.values()):
+        raise RuntimeError("replay contains events absent from exact extraction")
+    return peels
+
+
 def replay_domain(
     domain: str,
     binary_file: Path,
@@ -331,6 +926,8 @@ def replay_domain(
     gt_all: dict[int, np.ndarray],
     gt_sampled: dict[int, np.ndarray],
     background: np.ndarray,
+    gt_sorting: si.BaseSorting,
+    final_reference: dict | None,
     device: torch.device,
 ) -> dict[str, list[dict]]:
     from kilosort import io as ks_io
@@ -339,6 +936,10 @@ def replay_domain(
     bfile = ks_io.bfile_from_ops(
         ops=ops, filename=str(binary_file), device=device
     )
+    if int(ops["Nbatches"]) != int(bfile.n_batches):
+        raise RuntimeError(
+            f"ops/binary batch mismatch: {ops['Nbatches']} != {bfile.n_batches}"
+        )
     ctc = template_matching.prepare_matching(ops, U)
     nm = (U**2).sum(-1).sum(-1)
     if torch.any(nm <= 0):
@@ -360,6 +961,7 @@ def replay_domain(
     threshold_events = {threshold: [] for threshold in THRESHOLDS}
     threshold_event_scores = {threshold: [] for threshold in THRESHOLDS}
     threshold_event_peels = {threshold: [] for threshold in THRESHOLDS}
+    threshold_event_templates = {threshold: [] for threshold in THRESHOLDS}
 
     for ibatch in range(ops["Nbatches"]):
         if ibatch % 50 == 0:
@@ -472,10 +1074,12 @@ def replay_domain(
             )
             accepted_score = matched["score"].cpu().numpy()
             accepted_peel = matched["peel"].cpu().numpy()
+            accepted_template = matched["template"].cpu().numpy()
             valid = (accepted_global >= 0) & (accepted_global < bfile.n_samples)
             threshold_events[threshold].append(accepted_global[valid])
             threshold_event_scores[threshold].append(accepted_score[valid])
             threshold_event_peels[threshold].append(accepted_peel[valid])
+            threshold_event_templates[threshold].append(accepted_template[valid])
 
         del B0, Cf, Cfmax, Cmax, local_scores, local_templates, X
         if torch.cuda.is_available():
@@ -537,6 +1141,7 @@ def replay_domain(
         events = np.concatenate(threshold_events[threshold])
         scores = np.concatenate(threshold_event_scores[threshold])
         peels = np.concatenate(threshold_event_peels[threshold])
+        templates = np.concatenate(threshold_event_templates[threshold])
         event_match, gt_match = match_events_one_to_one(
             events, gt_frames_flat, MATCH_TOLERANCE_SAMPLES
         )
@@ -548,6 +1153,7 @@ def replay_domain(
             "events": events,
             "scores": scores,
             "peels": peels,
+            "templates": templates,
             "recovered": recovered,
             "recovered_peel": recovered_peel,
         }
@@ -626,6 +1232,33 @@ def replay_domain(
                     "accepted_events": int(peel_count),
                 }
             )
+    lineage_outputs = []
+    for threshold in LINEAGE_THRESHOLDS:
+        print(f"[{domain}] exact lineage at Th_learned={threshold:g}", flush=True)
+        lineage_ops = ops.copy()
+        lineage_ops["settings"] = ops["settings"].copy()
+        lineage_ops["Th_learned"] = threshold
+        st, tF, lineage_ops = template_matching.extract(
+            lineage_ops, bfile, U, device=device
+        )
+        peels = align_replay_peels(st, threshold_matches[threshold])
+        lineage_outputs.append(
+            run_event_lineage(
+                domain,
+                threshold,
+                lineage_ops,
+                st,
+                tF,
+                peels,
+                gt_sorting,
+                float(ops["fs"]),
+                int(bfile.imin),
+                final_reference if threshold == TEMPLATE_LEARNING_THRESHOLD else None,
+            )
+        )
+        del st, tF
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return {
         "histogram": hist_rows,
         "templates": template_rows,
@@ -633,12 +1266,41 @@ def replay_domain(
         "thresholds": threshold_rows,
         "peels": peel_rows,
         "samples": sample_rows,
+        "lineage_stages": [
+            row for output in lineage_outputs for row in output["lineage_stages"]
+        ],
+        "lineage_units": [
+            row for output in lineage_outputs for row in output["lineage_units"]
+        ],
+        "lineage_clusters": [
+            row
+            for output in lineage_outputs
+            for row in output["lineage_clusters"]
+        ],
+        "lineage_transitions": [
+            row
+            for output in lineage_outputs
+            for row in output["lineage_transitions"]
+        ],
+        "lineage_cluster_transitions": [
+            row
+            for output in lineage_outputs
+            for row in output["lineage_cluster_transitions"]
+        ],
+        "lineage_stage_deltas": [
+            row
+            for output in lineage_outputs
+            for row in output["lineage_stage_deltas"]
+        ],
+        "lineage_scores": [
+            row for output in lineage_outputs for row in output["lineage_scores"]
+        ],
     }
 
 
 def learn_denoised_templates(
     recording: si.BaseRecording, output_folder: Path
-) -> tuple[Path, np.ndarray]:
+) -> tuple[Path, np.ndarray, dict]:
     from kilosort import template_matching
 
     sorter_params = json.loads(PARAMS_PATH.read_text())["sorter"]
@@ -672,7 +1334,12 @@ def learn_denoised_templates(
         template_matching.extract = original_extract
     if "U" not in captured:
         raise RuntimeError("failed to capture learned templates")
-    return output_folder / "sorter_output" / "ops.npy", captured["U"]
+    sorter_output = output_folder / "sorter_output"
+    final_reference = {
+        "times": np.load(sorter_output / "spike_times.npy"),
+        "labels": np.load(sorter_output / "spike_clusters.npy"),
+    }
+    return sorter_output / "ops.npy", captured["U"], final_reference
 
 
 def main() -> None:
@@ -720,7 +1387,7 @@ def main() -> None:
         denoised_preprocessed, denoised_folder
     )
     template_learning_folder = SCRATCH / "diagnostic_template_learning"
-    ops_path, templates = learn_denoised_templates(
+    ops_path, templates, denoised_final_reference = learn_denoised_templates(
         denoised_saved, template_learning_folder
     )
     device = torch.device("cuda")
@@ -740,6 +1407,8 @@ def main() -> None:
         gt_all,
         gt_sampled,
         background,
+        gt,
+        denoised_final_reference,
         device,
     )
     del denoised_saved
@@ -755,6 +1424,8 @@ def main() -> None:
         gt_all,
         gt_sampled,
         background,
+        gt,
+        None,
         device,
     )
     del raw_saved
@@ -768,6 +1439,16 @@ def main() -> None:
         ("thresholds", "threshold_replay_summary.csv"),
         ("peels", "peel_summary.csv"),
         ("samples", "score_samples.csv"),
+        ("lineage_stages", "event_lineage_stage_summary.csv"),
+        ("lineage_units", "event_lineage_unit_summary.csv"),
+        ("lineage_clusters", "event_lineage_cluster_summary.csv"),
+        ("lineage_transitions", "event_lineage_transition_summary.csv"),
+        (
+            "lineage_cluster_transitions",
+            "event_lineage_cluster_transition_summary.csv",
+        ),
+        ("lineage_stage_deltas", "event_lineage_stage_deltas.csv"),
+        ("lineage_scores", "event_lineage_score_summary.csv"),
     ):
         pd.DataFrame([row for output in outputs for row in output[key]]).to_csv(
             RESULTS / filename, index=False
@@ -781,6 +1462,24 @@ def main() -> None:
         "template_source": "denoised",
         "template_learning_Th_learned": TEMPLATE_LEARNING_THRESHOLD,
         "replay_thresholds": THRESHOLDS,
+        "lineage_thresholds": LINEAGE_THRESHOLDS,
+        "lineage_stages": [
+            "detection_template",
+            "final_clustering",
+            "cluster_merging",
+            "duplicate_removal",
+        ],
+        "lineage_delta_time_ms": LINEAGE_DELTA_TIME_MS,
+        "lineage_match_score": LINEAGE_MATCH_SCORE,
+        "lineage_status_codes": STATUS_NAMES,
+        "lineage_scope": "controlled fixed-denoised-template chain; not independently relearned production templates per domain",
+        "denoised_Th8_lineage_reference": "exact template-learning sorting times and cluster partition, allowing cluster ID permutation",
+        "lineage_reference_order": "exact Kilosort save order; not independently sorted",
+        "lineage_npz_time_coordinates": "recording sample indices after applying bfile.imin",
+        "lineage_evaluation": "SpikeInterface compare_sorter_to_ground_truth with full benchmark settings",
+        "benchmark_evaluator_spikeinterface_version": "0.104.2",
+        "lineage_spikeinterface_version": versions["spikeinterface"],
+        "evaluator_matching_source_equivalence": "SpikeInterface 0.104.2 and 0.104.7 comparisontools.py and paircomparisons.py are byte-identical",
         "duration_s": EXPECTED_DURATION_S,
         "sampling_frequency": sampling_frequency,
         "gt_units": [int(unit_id) for unit_id in gt.unit_ids],
