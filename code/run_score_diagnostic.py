@@ -99,7 +99,7 @@ def matched_preprocessing(
     )
     kept_ids = denoised_clean.channel_ids.tolist()
     removed_ids = [item for item in denoised.channel_ids.tolist() if item not in kept_ids]
-    raw_clean = raw_filtered.channel_slice(kept_ids)
+    raw_clean = raw_filtered.select_channels(kept_ids)
     raw_preprocessed = spre.common_reference(
         raw_clean, reference="global", operator="median"
     )
