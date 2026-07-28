@@ -136,3 +136,18 @@ noise; native biological spikes can receive this benchmark label. The lineage is
 a controlled fixed-denoised-template experiment, not an independently relearned
 production sort for each input domain.
 
+To characterize the native raw baseline on the same 1,200-second interval, run:
+
+```bash
+./run --score-diagnostic-raw-native
+```
+
+This mode requires only the `probec_recording1_3` raw/GT mount. It derives the
+bad-channel mask, whitening, drift estimate, and learned templates from raw
+voltage at the default `Th_universal=9`, `Th_learned=8`, then runs the identical
+lineage analysis at learned thresholds 8 and 10.75. Its threshold-8 final sort
+is checked against the raw template-learning sort for exact times and cluster
+partition. Comparing this result with the denoised threshold-8 lineage gives the
+native default-baseline comparison; the fixed-template raw replay above answers
+a different controlled transfer question.
+

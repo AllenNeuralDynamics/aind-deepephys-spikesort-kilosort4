@@ -44,6 +44,25 @@ STATUS_NAMES = {
     2: "tp",
     3: "removed_by_dedup",
 }
+OUTPUT_FILES = (
+    ("histogram", "first_peel_local_max_histogram.csv"),
+    ("templates", "template_background_scores.csv"),
+    ("gt_units", "gt_unit_score_summary.csv"),
+    ("thresholds", "threshold_replay_summary.csv"),
+    ("peels", "peel_summary.csv"),
+    ("samples", "score_samples.csv"),
+    ("lineage_stages", "event_lineage_stage_summary.csv"),
+    ("lineage_units", "event_lineage_unit_summary.csv"),
+    ("lineage_clusters", "event_lineage_cluster_summary.csv"),
+    ("lineage_transitions", "event_lineage_transition_summary.csv"),
+    (
+        "lineage_cluster_transitions",
+        "event_lineage_cluster_transition_summary.csv",
+    ),
+    ("lineage_stage_deltas", "event_lineage_stage_deltas.csv"),
+    ("lineage_scores", "event_lineage_score_summary.csv"),
+    ("lineage_alignment", "event_lineage_replay_alignment.csv"),
+)
 
 
 def json_default(value):
@@ -54,6 +73,8 @@ def json_default(value):
     if isinstance(value, Path):
         return str(value)
     raise TypeError(f"cannot JSON-serialize {type(value).__name__}")
+
+
 BAD_CHANNEL_KWARGS = {
     "method": "coherence+psd",
     "dead_channel_threshold": -0.5,
@@ -84,6 +105,13 @@ def discover_inputs() -> tuple[Path, Path, Path]:
     raw = single_path(sorted(raw_root.rglob("recording.zarr")), "raw recording.zarr")
     gt = single_path(sorted(raw_root.rglob("sorting.zarr")), "GT sorting.zarr")
     return raw, denoised, gt
+
+
+def discover_raw_inputs() -> tuple[Path, Path]:
+    raw_root = DATA / RAW_MOUNT
+    raw = single_path(sorted(raw_root.rglob("recording.zarr")), "raw recording.zarr")
+    gt = single_path(sorted(raw_root.rglob("sorting.zarr")), "GT sorting.zarr")
+    return raw, gt
 
 
 def phase_highpass(recording: si.BaseRecording) -> si.BaseRecording:
@@ -129,6 +157,27 @@ def matched_preprocessing(
     if raw_preprocessed.get_num_channels() != denoised_preprocessed.get_num_channels():
         raise ValueError("matched preprocessing produced different channel counts")
     return raw_preprocessed, denoised_preprocessed, kept_ids, removed_ids
+
+
+def raw_native_preprocessing(
+    raw: si.BaseRecording,
+) -> tuple[si.BaseRecording, list, list]:
+    raw_filtered = phase_highpass(raw)
+    raw_clean = spre.detect_and_remove_bad_channels(
+        raw_filtered, **BAD_CHANNEL_KWARGS
+    )
+    kept_ids = raw_clean.channel_ids.tolist()
+    removed_ids = [item for item in raw.channel_ids.tolist() if item not in kept_ids]
+    raw_preprocessed = spre.common_reference(
+        raw_clean, reference="global", operator="median"
+    )
+    if np.dtype(raw_preprocessed.get_dtype()) != np.dtype("float32"):
+        raise ValueError("raw-native preprocessing did not produce float32")
+    if raw_preprocessed.get_num_samples(segment_index=0) != raw.get_num_samples(
+        segment_index=0
+    ):
+        raise ValueError("raw-native preprocessing changed sample count")
+    return raw_preprocessed, kept_ids, removed_ids
 
 
 def save_recording(recording: si.BaseRecording, folder: Path) -> si.BaseRecording:
@@ -1475,7 +1524,7 @@ def replay_domain(
     }
 
 
-def learn_denoised_templates(
+def learn_templates(
     recording: si.BaseRecording, output_folder: Path
 ) -> tuple[Path, np.ndarray, dict]:
     from kilosort import template_matching
@@ -1517,6 +1566,13 @@ def learn_denoised_templates(
         "labels": np.load(sorter_output / "spike_clusters.npy"),
     }
     return sorter_output / "ops.npy", captured["U"], final_reference
+
+
+def write_tabular_outputs(outputs: list[dict]) -> None:
+    for key, filename in OUTPUT_FILES:
+        pd.DataFrame([row for output in outputs for row in output[key]]).to_csv(
+            RESULTS / filename, index=False
+        )
 
 
 def main() -> None:
@@ -1564,7 +1620,7 @@ def main() -> None:
         denoised_preprocessed, denoised_folder
     )
     template_learning_folder = SCRATCH / "diagnostic_template_learning"
-    ops_path, templates, denoised_final_reference = learn_denoised_templates(
+    ops_path, templates, denoised_final_reference = learn_templates(
         denoised_saved, template_learning_folder
     )
     device = torch.device("cuda")
@@ -1615,28 +1671,7 @@ def main() -> None:
     shutil.rmtree(raw_folder)
     outputs = [raw_output, denoised_output]
 
-    for key, filename in (
-        ("histogram", "first_peel_local_max_histogram.csv"),
-        ("templates", "template_background_scores.csv"),
-        ("gt_units", "gt_unit_score_summary.csv"),
-        ("thresholds", "threshold_replay_summary.csv"),
-        ("peels", "peel_summary.csv"),
-        ("samples", "score_samples.csv"),
-        ("lineage_stages", "event_lineage_stage_summary.csv"),
-        ("lineage_units", "event_lineage_unit_summary.csv"),
-        ("lineage_clusters", "event_lineage_cluster_summary.csv"),
-        ("lineage_transitions", "event_lineage_transition_summary.csv"),
-        (
-            "lineage_cluster_transitions",
-            "event_lineage_cluster_transition_summary.csv",
-        ),
-        ("lineage_stage_deltas", "event_lineage_stage_deltas.csv"),
-        ("lineage_scores", "event_lineage_score_summary.csv"),
-        ("lineage_alignment", "event_lineage_replay_alignment.csv"),
-    ):
-        pd.DataFrame([row for output in outputs for row in output[key]]).to_csv(
-            RESULTS / filename, index=False
-        )
+    write_tabular_outputs(outputs)
     manifest = {
         "diagnostic": "fixed denoised templates and preprocessing replayed on raw and denoised",
         "kilosort_version": versions["kilosort"],
