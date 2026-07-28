@@ -203,12 +203,16 @@ def simulate_matching(
     U: torch.Tensor,
     ctc: torch.Tensor,
     threshold: float,
+    X: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Run the exact 4.1.7 matching-pursuit decisions without feature export."""
     nt = ops["nt"]
+    W = ops["wPCA"].contiguous()
     nm = (U**2).sum(-1).sum(-1)
     B = B_initial.clone()
     trange = torch.arange(-nt, nt + 1, device=B.device)
+    tiwave = torch.arange(-(nt // 2), nt // 2 + 1, device=B.device)
+    Xres = X.clone() if X is not None else None
     accepted_time = []
     accepted_template = []
     accepted_score = []
@@ -241,6 +245,10 @@ def simulate_matching(
             torch.full((iX.shape[0],), peel, dtype=torch.int64, device=B.device)
         )
         for parity in range(2):
+            if Xres is not None:
+                Xres[:, iX[parity::2] + tiwave] -= amplitude[parity::2] * (
+                    torch.einsum("ijk, jl -> kil", U[iY[parity::2, 0]], W)
+                )
             B[:, iX[parity::2] + trange] -= amplitude[parity::2] * ctc[
                 :, iY[parity::2, 0], :
             ]
@@ -255,6 +263,7 @@ def simulate_matching(
         ),
         "peel": torch.cat(accepted_peel) if accepted_peel else empty_long,
         "peel_counts": torch.as_tensor(peel_counts, dtype=torch.int64),
+        "Xres": Xres,
     }
 
 
@@ -880,8 +889,8 @@ def run_event_lineage(
     }
 
 
-def align_replay_peels(st: np.ndarray, replay: dict) -> tuple[np.ndarray, dict]:
-    """Attach replayed peel IDs using exact event-key multiplicities."""
+def summarize_replay_extraction(st: np.ndarray, replay: dict) -> dict:
+    """Summarize independent replay differences without assigning lineage."""
     replay_scores = replay["scores"].astype(np.float32)
     replay_keys = np.column_stack(
         (
@@ -902,55 +911,163 @@ def align_replay_peels(st: np.ndarray, replay: dict) -> tuple[np.ndarray, dict]:
     extracted_by_key = {}
     for index, key in enumerate(map(tuple, extracted_keys)):
         extracted_by_key.setdefault(key, []).append(index)
-    if replay_by_key.keys() != extracted_by_key.keys():
-        missing = sorted(extracted_by_key.keys() - replay_by_key.keys())[:10]
-        extra = sorted(replay_by_key.keys() - extracted_by_key.keys())[:10]
-        raise RuntimeError(
-            f"replay/extraction event keys differ; missing={missing}, extra={extra}"
-        )
-
-    peels = np.empty(st.shape[0], dtype=np.int16)
-    aligned_replay_scores = np.empty(st.shape[0], dtype=np.float32)
-    score_differences = np.empty(st.shape[0], dtype=np.float32)
+    score_differences = []
     duplicate_events = 0
-    for key, extracted_indices in extracted_by_key.items():
+    common_events = 0
+    for key in extracted_by_key.keys() & replay_by_key.keys():
+        extracted_indices = extracted_by_key[key]
         replay_indices = replay_by_key[key]
-        if len(extracted_indices) != len(replay_indices):
-            raise RuntimeError(
-                "replay/extraction event multiplicity differs for "
-                f"{key}: {len(replay_indices)} != {len(extracted_indices)}"
-            )
         if len(extracted_indices) > 1:
             duplicate_events += len(extracted_indices)
+        count = min(len(extracted_indices), len(replay_indices))
+        common_events += count
         extracted_order = np.asarray(extracted_indices)[
             np.argsort(extracted_scores[extracted_indices], kind="stable")
-        ]
+        ][:count]
         replay_order = np.asarray(replay_indices)[
             np.argsort(replay_scores[replay_indices], kind="stable")
-        ]
-        peels[extracted_order] = replay["peels"][replay_order]
-        aligned_replay_scores[extracted_order] = replay_scores[replay_order]
-        score_differences[extracted_order] = np.abs(
+        ][:count]
+        score_differences.extend(
+            np.abs(
             extracted_scores[extracted_order]
-            - aligned_replay_scores[extracted_order]
+                - replay_scores[replay_order]
+            ).tolist()
         )
-    close = np.isclose(
-        extracted_scores,
-        aligned_replay_scores,
-        rtol=1e-6,
-        atol=1e-6,
+    score_differences = np.asarray(score_differences, dtype=np.float32)
+    close = np.isclose(score_differences, 0, rtol=1e-6, atol=1e-6)
+    event_match, _ = match_events_one_to_one(
+        st[:, 0].astype(np.int64),
+        replay["events"].astype(np.int64),
+        MATCH_TOLERANCE_SAMPLES,
     )
     summary = {
         "events": int(st.shape[0]),
         "event_keys": int(len(extracted_by_key)),
         "events_in_duplicate_keys": int(duplicate_events),
+        "replay_events": int(replay["events"].size),
+        "exact_time_template_events": int(common_events),
+        "extraction_only_events": int(st.shape[0] - common_events),
+        "replay_only_events": int(replay["events"].size - common_events),
+        "time_matched_events_within_tolerance": int(event_match.size),
         "score_close_events": int(close.sum()),
         "score_different_events": int((~close).sum()),
-        "score_abs_difference_mean": float(score_differences.mean()),
-        "score_abs_difference_max": float(score_differences.max()),
-        "score_abs_difference_q99": float(np.quantile(score_differences, 0.99)),
+        "score_abs_difference_mean": (
+            float(score_differences.mean()) if score_differences.size else np.nan
+        ),
+        "score_abs_difference_max": (
+            float(score_differences.max()) if score_differences.size else np.nan
+        ),
+        "score_abs_difference_q99": (
+            float(np.quantile(score_differences, 0.99))
+            if score_differences.size
+            else np.nan
+        ),
     }
-    return peels, summary
+    return summary
+
+
+def extract_with_peels(
+    ops: dict,
+    bfile,
+    U: torch.Tensor,
+    device: torch.device,
+) -> tuple[np.ndarray, torch.Tensor, dict, np.ndarray]:
+    """Run one exact extraction while capturing each event's peel inline."""
+    from kilosort import template_matching
+
+    captured_rows = []
+    captured_peels = []
+    original_run_matching = template_matching.run_matching
+    batch_index = 0
+
+    def run_matching_with_peels(local_ops, X, local_U, ctc, device=device):
+        nonlocal batch_index
+        B = initial_projection(local_ops, X, local_U)
+        matched = simulate_matching(
+            local_ops,
+            B,
+            local_U,
+            ctc,
+            local_ops["Th_learned"],
+            X=X,
+        )
+        local_st = torch.column_stack((matched["time"], matched["template"]))
+        keep = np.ones(local_st.shape[0], dtype=bool)
+        if batch_index == 0:
+            local_times = local_st[:, 0].cpu().numpy()
+            keep = (
+                local_times
+                - local_ops["nt"]
+                - local_ops["nt"] // 2
+                + local_ops["nt0min"]
+            ) >= 0
+        shift = (
+            batch_index
+            * bfile.batch_downsampling
+            * local_ops["batch_size"]
+        )
+        rows = np.column_stack(
+            (
+                (
+                    local_st[:, 0].cpu().numpy()
+                    - local_ops["nt"]
+                    + shift
+                    - local_ops["nt"] // 2
+                    + local_ops["nt0min"]
+                ),
+                local_st[:, 1].cpu().numpy(),
+                matched["score"].cpu().numpy(),
+            )
+        )
+        captured_rows.append(rows[keep])
+        captured_peels.append(matched["peel"].cpu().numpy()[keep])
+        batch_index += 1
+        return (
+            local_st,
+            matched["amplitude"].unsqueeze(1),
+            matched["score"].unsqueeze(1),
+            matched["Xres"],
+        )
+
+    template_matching.run_matching = run_matching_with_peels
+    try:
+        st, tF, ops = template_matching.extract(
+            ops, bfile, U, device=device
+        )
+    finally:
+        template_matching.run_matching = original_run_matching
+    if batch_index != int(bfile.n_batches):
+        raise RuntimeError(
+            f"inline peel capture covered {batch_index}/{bfile.n_batches} batches"
+        )
+    captured_st = np.concatenate(captured_rows)
+    peels = np.concatenate(captured_peels)
+    order = np.argsort(captured_st[:, 0])
+    captured_st = captured_st[order]
+    peels = peels[order]
+    if np.any((peels < 0) | (peels >= int(ops["max_peels"]))):
+        raise RuntimeError("inline peel capture produced an invalid peel index")
+    if not np.array_equal(captured_st[:, :2].astype(np.int64), st[:, :2].astype(np.int64)):
+        raise RuntimeError("inline peel capture changed extraction event identity")
+    if not np.allclose(captured_st[:, 2], st[:, 2], rtol=0, atol=0):
+        raise RuntimeError("inline peel capture changed extraction scores")
+    return st, tF, ops, peels
+
+
+def write_lineage_checkpoint(
+    domain: str,
+    threshold: float,
+    output: dict[str, list[dict]],
+    alignment: dict,
+) -> None:
+    """Persist one completed lineage chain before starting the next one."""
+    threshold_name = str(threshold).replace(".", "p")
+    prefix = f"checkpoint_{domain}_Th_{threshold_name}"
+    for key, rows in output.items():
+        pd.DataFrame(rows).to_csv(RESULTS / f"{prefix}_{key}.csv", index=False)
+    pd.DataFrame([alignment]).to_csv(
+        RESULTS / f"{prefix}_replay_alignment.csv", index=False
+    )
 
 
 def replay_domain(
@@ -1269,31 +1386,42 @@ def replay_domain(
             )
     lineage_outputs = []
     lineage_alignment_rows = []
+    pd.DataFrame(threshold_rows).to_csv(
+        RESULTS / f"checkpoint_{domain}_threshold_replay_summary.csv", index=False
+    )
+    pd.DataFrame(gt_rows).to_csv(
+        RESULTS / f"checkpoint_{domain}_gt_unit_score_summary.csv", index=False
+    )
+    pd.DataFrame(peel_rows).to_csv(
+        RESULTS / f"checkpoint_{domain}_peel_summary.csv", index=False
+    )
     for threshold in LINEAGE_THRESHOLDS:
         print(f"[{domain}] exact lineage at Th_learned={threshold:g}", flush=True)
         lineage_ops = ops.copy()
         lineage_ops["settings"] = ops["settings"].copy()
         lineage_ops["Th_learned"] = threshold
-        st, tF, lineage_ops = template_matching.extract(
-            lineage_ops, bfile, U, device=device
+        st, tF, lineage_ops, peels = extract_with_peels(
+            lineage_ops, bfile, U, device
         )
-        peels, alignment = align_replay_peels(st, threshold_matches[threshold])
+        alignment = summarize_replay_extraction(
+            st, threshold_matches[threshold]
+        )
         alignment.update({"domain": domain, "Th_learned": threshold})
         lineage_alignment_rows.append(alignment)
-        lineage_outputs.append(
-            run_event_lineage(
-                domain,
-                threshold,
-                lineage_ops,
-                st,
-                tF,
-                peels,
-                gt_sorting,
-                float(ops["fs"]),
-                int(bfile.imin),
-                final_reference if threshold == TEMPLATE_LEARNING_THRESHOLD else None,
-            )
+        lineage_output = run_event_lineage(
+            domain,
+            threshold,
+            lineage_ops,
+            st,
+            tF,
+            peels,
+            gt_sorting,
+            float(ops["fs"]),
+            int(bfile.imin),
+            final_reference if threshold == TEMPLATE_LEARNING_THRESHOLD else None,
         )
+        lineage_outputs.append(lineage_output)
+        write_lineage_checkpoint(domain, threshold, lineage_output, alignment)
         del st, tF
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1433,6 +1561,12 @@ def main() -> None:
     ops = ks_io.load_ops(ops_path, device=device)
     U = torch.from_numpy(templates).to(device)
     shutil.copy2(ops_path, RESULTS / "fixed_denoised_ops.npy")
+    np.save(RESULTS / "fixed_denoised_learned_templates.npy", templates)
+    np.save(RESULTS / "fixed_denoised_whitening_matrix.npy", ops["Wrot"].cpu())
+    np.savez_compressed(
+        RESULTS / "denoised_template_learning_final_sort.npz",
+        **denoised_final_reference,
+    )
     shutil.rmtree(template_learning_folder)
     scoreable_start, scoreable_stop = replay_frame_bounds(ops, end_frame)
     gt_all, background, gt_sampled, gt_excluded_by_unit = sample_gt_and_background(
@@ -1493,8 +1627,6 @@ def main() -> None:
         pd.DataFrame([row for output in outputs for row in output[key]]).to_csv(
             RESULTS / filename, index=False
         )
-    np.save(RESULTS / "fixed_denoised_learned_templates.npy", templates)
-    np.save(RESULTS / "fixed_denoised_whitening_matrix.npy", ops["Wrot"].cpu())
     manifest = {
         "diagnostic": "fixed denoised templates and preprocessing replayed on raw and denoised",
         "kilosort_version": versions["kilosort"],
@@ -1516,6 +1648,8 @@ def main() -> None:
         "denoised_Th8_lineage_reference": "exact template-learning sorting times and cluster partition, allowing cluster ID permutation",
         "lineage_reference_order": "exact Kilosort save order; not independently sorted",
         "lineage_npz_time_coordinates": "recording sample indices after applying bfile.imin",
+        "lineage_peel_source": "captured inline during the same exact extraction pass that produced each event",
+        "independent_replay_role": "score calibration and non-authoritative extraction-difference summary only",
         "lineage_evaluation": "SpikeInterface compare_sorter_to_ground_truth with full benchmark settings",
         "benchmark_evaluator_spikeinterface_version": "0.104.2",
         "lineage_spikeinterface_version": versions["spikeinterface"],
