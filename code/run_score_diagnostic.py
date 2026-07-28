@@ -653,6 +653,7 @@ def run_event_lineage(
     sampling_frequency: float,
     imin: int,
     final_reference: dict | None = None,
+    archive_mode: str = "full",
 ) -> dict[str, list[dict]]:
     """Trace extracted events through clustering, merging, and deduplication."""
     from kilosort import clustering_qr, postprocessing, template_matching
@@ -929,6 +930,22 @@ def run_event_lineage(
         archive[f"{stage_name}_status"] = result["status"]
         archive[f"{stage_name}_assigned_gt"] = result["assigned_gt"]
         archive[f"{stage_name}_gt_proximal"] = result["gt_proximal"]
+    if archive_mode == "compact":
+        archive = {
+            "event_id": event_ids.astype(np.int32),
+            "detection_time": detection_times,
+            "detection_template": detection_templates,
+            "detection_score": detection_scores,
+            "detection_peel": peels.astype(np.int16),
+            "postmerge_time": merged_times,
+            "postmerge_cluster": merged_labels,
+            "kept_after_dedup": kept,
+            "final_status": stages[-1][1]["status"],
+            "final_assigned_gt": stages[-1][1]["assigned_gt"].astype(np.int32),
+            "final_gt_proximal": stages[-1][1]["gt_proximal"],
+        }
+    elif archive_mode != "full":
+        raise ValueError(f"unsupported event archive mode: {archive_mode}")
     threshold_name = str(threshold).replace(".", "p")
     np.savez_compressed(
         RESULTS / f"event_lineage_{domain}_Th_{threshold_name}.npz", **archive
@@ -1140,6 +1157,8 @@ def replay_domain(
     gt_sorting: si.BaseSorting,
     final_reference: dict | None,
     device: torch.device,
+    lineage_thresholds: tuple[float, ...] = LINEAGE_THRESHOLDS,
+    archive_mode: str = "full",
 ) -> dict[str, list[dict]]:
     from kilosort import io as ks_io
     from kilosort import template_matching
@@ -1454,7 +1473,11 @@ def replay_domain(
     pd.DataFrame(peel_rows).to_csv(
         RESULTS / f"checkpoint_{domain}_peel_summary.csv", index=False
     )
-    for threshold in LINEAGE_THRESHOLDS:
+    if not lineage_thresholds or any(
+        threshold not in THRESHOLDS for threshold in lineage_thresholds
+    ):
+        raise ValueError(f"invalid lineage thresholds: {lineage_thresholds}")
+    for threshold in lineage_thresholds:
         print(f"[{domain}] exact lineage at Th_learned={threshold:g}", flush=True)
         lineage_ops = ops.copy()
         lineage_ops["settings"] = ops["settings"].copy()
@@ -1478,6 +1501,7 @@ def replay_domain(
             float(ops["fs"]),
             int(bfile.imin),
             final_reference if threshold == TEMPLATE_LEARNING_THRESHOLD else None,
+            archive_mode,
         )
         lineage_outputs.append(lineage_output)
         write_lineage_checkpoint(domain, threshold, lineage_output, alignment)

@@ -89,6 +89,8 @@ def main() -> None:
         gt,
         final_reference,
         device,
+        lineage_thresholds=(diagnostic.TEMPLATE_LEARNING_THRESHOLD,),
+        archive_mode="compact",
     )
     diagnostic.write_tabular_outputs([output])
     del raw_saved
@@ -101,7 +103,8 @@ def main() -> None:
         "template_source": "raw",
         "template_learning_Th_learned": diagnostic.TEMPLATE_LEARNING_THRESHOLD,
         "replay_thresholds": diagnostic.THRESHOLDS,
-        "lineage_thresholds": diagnostic.LINEAGE_THRESHOLDS,
+        "lineage_thresholds": [diagnostic.TEMPLATE_LEARNING_THRESHOLD],
+        "event_archive_mode": "compact",
         "lineage_stages": [
             "detection_template",
             "final_clustering",

@@ -145,9 +145,11 @@ To characterize the native raw baseline on the same 1,200-second interval, run:
 This mode requires only the `probec_recording1_3` raw/GT mount. It derives the
 bad-channel mask, whitening, drift estimate, and learned templates from raw
 voltage at the default `Th_universal=9`, `Th_learned=8`, then runs the identical
-lineage analysis at learned thresholds 8 and 10.75. Its threshold-8 final sort
-is checked against the raw template-learning sort for exact times and cluster
-partition. Comparing this result with the denoised threshold-8 lineage gives the
+lineage analysis at learned threshold 8. Its final sort is checked against the
+raw template-learning sort for exact times and cluster partition. The event-level
+archive retains the fields needed for baseline peel/score analysis in compact
+form; every stage, unit, cluster, transition, and score summary remains available
+as CSV. Comparing this result with the denoised threshold-8 lineage gives the
 native default-baseline comparison; the fixed-template raw replay above answers
 a different controlled transfer question.
 
