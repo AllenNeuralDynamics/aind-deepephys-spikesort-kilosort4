@@ -44,6 +44,16 @@ STATUS_NAMES = {
     2: "tp",
     3: "removed_by_dedup",
 }
+
+
+def json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"cannot JSON-serialize {type(value).__name__}")
 BAD_CHANNEL_KWARGS = {
     "method": "coherence+psd",
     "dead_channel_threshold": -0.5,
@@ -1684,9 +1694,9 @@ def main() -> None:
         "elapsed_s": time.perf_counter() - started,
     }
     (RESULTS / "score_diagnostic_manifest.json").write_text(
-        json.dumps(manifest, indent=2, default=list) + "\n"
+        json.dumps(manifest, indent=2, default=json_default) + "\n"
     )
-    print(json.dumps(manifest, indent=2, default=list), flush=True)
+    print(json.dumps(manifest, indent=2, default=json_default), flush=True)
 
 
 if __name__ == "__main__":
