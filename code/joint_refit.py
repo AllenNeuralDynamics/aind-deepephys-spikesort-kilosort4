@@ -65,7 +65,14 @@ def solve_nonnegative_quadratic(
     if rhs.shape != (gram.shape[0],) or initial.shape != rhs.shape:
         raise ValueError("rhs and initial must match the Gram dimension")
     if gram.numel() == 0:
-        return initial.clone(), {"iterations": 0, "converged": True, "rank": 0}
+        return initial.clone(), {
+            "iterations": 0,
+            "converged": True,
+            "rank": 0,
+            "condition": float("nan"),
+            "condition_is_proxy": False,
+            "solver": "empty",
+        }
 
     gram = (gram + gram.T) / 2
     amplitude = initial.clamp_min(0).clone()
@@ -77,6 +84,25 @@ def solve_nonnegative_quadratic(
         )
     ).max()
     tolerance = torch.finfo(gram.dtype).eps * max(1, gram.shape[0]) * scale
+
+    factor, factor_info = torch.linalg.cholesky_ex(gram)
+    if int(factor_info) == 0:
+        candidate = torch.cholesky_solve(rhs[:, None], factor)[:, 0]
+        if bool(torch.all(candidate > tolerance)):
+            factor_diagonal = factor.diagonal().abs()
+            condition_proxy = float(
+                (factor_diagonal.max() / factor_diagonal.min()) ** 2
+            )
+            return candidate, {
+                "iterations": 0,
+                "converged": True,
+                "rank": int(gram.shape[0]),
+                "condition": condition_proxy,
+                "condition_is_proxy": True,
+                "solver": "cholesky",
+                "tolerance": float(tolerance),
+            }
+
     passive = amplitude > tolerance
     max_iterations = max(1, 3 * gram.shape[0])
     iterations = 0
@@ -129,6 +155,8 @@ def solve_nonnegative_quadratic(
         "converged": converged,
         "rank": rank,
         "condition": condition,
+        "condition_is_proxy": False,
+        "solver": "active_set_eigh",
         "tolerance": float(tolerance),
     }
 

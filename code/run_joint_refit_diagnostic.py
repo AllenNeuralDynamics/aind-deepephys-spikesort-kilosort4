@@ -264,9 +264,12 @@ def run_joint_refit_matching(
         right = torch.searchsorted(sorted_times, times + nt, side="right")
 
         block_sizes = []
-        conditions = []
+        condition_proxies = []
+        spectral_conditions = []
         solver_iterations = []
         overlap_blocks = 0
+        cholesky_fast_path_blocks = 0
+        active_set_fallback_blocks = 0
         changed_amplitudes = 0
         zeroed_amplitudes = 0
         rank_deficient_blocks = 0
@@ -293,7 +296,14 @@ def run_joint_refit_matching(
                 before,
                 nt,
             )
-            conditions.append(stats["condition"])
+            if stats["condition_is_proxy"]:
+                condition_proxies.append(stats["condition"])
+            else:
+                spectral_conditions.append(stats["condition"])
+            if stats["solver"] == "cholesky":
+                cholesky_fast_path_blocks += 1
+            else:
+                active_set_fallback_blocks += 1
             solver_iterations.append(stats["iterations"])
             if stats["rank"] < block_size:
                 rank_deficient_blocks += 1
@@ -326,7 +336,12 @@ def run_joint_refit_matching(
             refit_energy_reduction += energy_reduction
 
         residual_energy -= refit_energy_reduction
-        finite_conditions = [value for value in conditions if np.isfinite(value)]
+        finite_condition_proxies = [
+            value for value in condition_proxies if np.isfinite(value)
+        ]
+        finite_spectral_conditions = [
+            value for value in spectral_conditions if np.isfinite(value)
+        ]
         telemetry_rows.append(
             {
                 "peel": peel,
@@ -353,11 +368,30 @@ def run_joint_refit_matching(
                 "block_size_p90": _quantile(block_sizes, 0.9),
                 "block_size_p99": _quantile(block_sizes, 0.99),
                 "block_size_max": max(block_sizes),
-                "gram_condition_p50": _quantile(finite_conditions, 0.5),
-                "gram_condition_p90": _quantile(finite_conditions, 0.9),
-                "gram_condition_max": (
-                    max(finite_conditions) if finite_conditions else np.nan
+                "gram_cholesky_condition_proxy_p50": _quantile(
+                    finite_condition_proxies, 0.5
                 ),
+                "gram_cholesky_condition_proxy_p90": _quantile(
+                    finite_condition_proxies, 0.9
+                ),
+                "gram_cholesky_condition_proxy_max": (
+                    max(finite_condition_proxies)
+                    if finite_condition_proxies
+                    else np.nan
+                ),
+                "gram_fallback_spectral_condition_p50": _quantile(
+                    finite_spectral_conditions, 0.5
+                ),
+                "gram_fallback_spectral_condition_p90": _quantile(
+                    finite_spectral_conditions, 0.9
+                ),
+                "gram_fallback_spectral_condition_max": (
+                    max(finite_spectral_conditions)
+                    if finite_spectral_conditions
+                    else np.nan
+                ),
+                "cholesky_fast_path_blocks": cholesky_fast_path_blocks,
+                "active_set_fallback_blocks": active_set_fallback_blocks,
                 "rank_deficient_blocks": rank_deficient_blocks,
                 "nonconverged_blocks": nonconverged_blocks,
                 "reverted_blocks": reverted_blocks,
@@ -716,7 +750,8 @@ def main() -> None:
         "Th_learned": THRESHOLD,
         "refit_timing": "after original greedy subtraction on every peel",
         "refit_scope": "each newly detected event plus all positive-amplitude events with center lag within [-nt, nt]",
-        "solver": "warm-start active-set NNLS with machine-precision eigenspace rank cutoff and no ridge",
+        "solver": "exact Cholesky solve for positive-definite blocks with a strictly positive solution; warm-start active-set eigensolver fallback with machine-precision rank cutoff; no ridge",
+        "condition_telemetry": "squared Cholesky diagonal ratio proxy on fast-path blocks; exact positive-eigenspace spectral condition on fallback blocks",
         "block_order": "new events in ascending sample order; overlapping blocks are sequential block-coordinate updates",
         "duplicate_policy": "identical time-template atoms share one amplitude variable and can be revived after reaching zero",
         "baseline_control": (

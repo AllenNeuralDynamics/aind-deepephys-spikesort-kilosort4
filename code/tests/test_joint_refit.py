@@ -132,7 +132,23 @@ def test_negative_unconstrained_amplitude_is_zeroed() -> None:
         amplitude, torch.tensor([1.0, 0.0], dtype=torch.float64)
     )
     assert diagnostics["converged"]
+    assert diagnostics["solver"] == "active_set_eigh"
     assert torch.all(amplitude >= 0)
+
+
+def test_positive_full_rank_solution_uses_cholesky_fast_path() -> None:
+    gram = torch.tensor([[2.0, 0.5], [0.5, 1.0]], dtype=torch.float64)
+    expected = torch.tensor([1.0, 2.0], dtype=torch.float64)
+
+    amplitude, diagnostics = solve_nonnegative_quadratic(
+        gram, gram @ expected, torch.tensor([0.5, 0.5], dtype=torch.float64)
+    )
+
+    torch.testing.assert_close(amplitude, expected)
+    assert diagnostics["converged"]
+    assert diagnostics["solver"] == "cholesky"
+    assert diagnostics["rank"] == 2
+    assert diagnostics["condition_is_proxy"]
 
 
 def test_rank_deficient_duplicate_atoms_are_safe() -> None:
@@ -145,6 +161,7 @@ def test_rank_deficient_duplicate_atoms_are_safe() -> None:
     objective_after = 0.5 * amplitude @ gram @ amplitude - rhs @ amplitude
 
     assert diagnostics["converged"]
+    assert diagnostics["solver"] == "active_set_eigh"
     assert diagnostics["rank"] == 1
     assert torch.all(amplitude >= 0)
     torch.testing.assert_close(amplitude.sum(), torch.tensor(1.5, dtype=gram.dtype))

@@ -210,12 +210,15 @@ projections before the next peel. Overlapping blocks are processed in ascending
 sample order as sequential block-coordinate updates. Identical time-template
 detections share one amplitude variable.
 
-The solver uses an active-set NNLS update, a machine-precision eigenspace rank
-cutoff, and no ridge or ground-truth-derived parameter. Per-batch/per-peel output
-reports greedy and additional refit energy reduction, overlap-block sizes, Gram
-conditioning, rank and convergence safeguards, amplitude changes, zeroed events,
-late-peel counts, and runtime. Ground truth is applied only after extraction by
-the same lineage evaluator used for the baseline diagnostics.
+The solver uses an exact Cholesky fast path when a block is positive definite and
+its unconstrained solution is strictly positive. Boundary or singular blocks use
+the active-set eigensolver with a machine-precision rank cutoff. Neither path uses
+a ridge or ground-truth-derived parameter. Per-batch/per-peel output reports the
+solver-path counts, greedy and additional refit energy reduction, overlap-block
+sizes, a Cholesky conditioning proxy or exact fallback spectral condition, rank
+and convergence safeguards, amplitude changes, zeroed events, late-peel counts,
+and runtime. Ground truth is applied only after extraction by the same lineage
+evaluator used for the baseline diagnostics.
 
 Each run also executes unchanged Kilosort 4.1.7 with the identical native
 preprocessing, learned `ops`, templates, binary recording, and batch boundaries.
