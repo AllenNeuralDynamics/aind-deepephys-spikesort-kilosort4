@@ -346,7 +346,7 @@ def main() -> None:
         raise ValueError("raw and denoised channel identities differ")
     if raw.get_num_channels() != 384 or denoised.get_num_channels() != 384:
         raise ValueError("selection requires the original 384-channel recordings")
-    if not raw.has_scaled_traces() or not denoised.has_scaled_traces():
+    if not raw.has_scaleable_traces() or not denoised.has_scaleable_traces():
         raise ValueError("source recordings must expose scaled voltage traces")
     if raw.get_sampling_frequency() != EXPECTED_SAMPLING_FREQUENCY:
         raise ValueError(f"unexpected raw sampling frequency: {raw.get_sampling_frequency()}")
