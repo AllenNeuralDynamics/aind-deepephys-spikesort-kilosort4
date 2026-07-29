@@ -6,16 +6,13 @@ import json
 import os
 import shutil
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.nn.functional import conv1d, max_pool1d
-
-import spikeinterface as si
-import spikeinterface.preprocessing as spre
-from spikeinterface.sorters.external.kilosort4 import Kilosort4Sorter
 
 
 DATA = Path("../data")
@@ -115,6 +112,8 @@ def discover_raw_inputs() -> tuple[Path, Path]:
 
 
 def phase_highpass(recording: si.BaseRecording) -> si.BaseRecording:
+    import spikeinterface.preprocessing as spre
+
     processed = recording
     if "inter_sample_shift" in processed.get_property_keys():
         processed = spre.phase_shift(
@@ -128,6 +127,8 @@ def phase_highpass(recording: si.BaseRecording) -> si.BaseRecording:
 def matched_preprocessing(
     raw: si.BaseRecording, denoised: si.BaseRecording
 ) -> tuple[si.BaseRecording, si.BaseRecording, list, list]:
+    import spikeinterface.preprocessing as spre
+
     if not np.array_equal(raw.channel_ids, denoised.channel_ids):
         raise ValueError("raw and denoised channel IDs or ordering differ")
     raw_filtered = phase_highpass(raw)
@@ -162,6 +163,8 @@ def matched_preprocessing(
 def raw_native_preprocessing(
     raw: si.BaseRecording,
 ) -> tuple[si.BaseRecording, list, list]:
+    import spikeinterface.preprocessing as spre
+
     raw_filtered = phase_highpass(raw)
     raw_clean = spre.detect_and_remove_bad_channels(
         raw_filtered, **BAD_CHANNEL_KWARGS
@@ -263,6 +266,7 @@ def simulate_matching(
     ctc: torch.Tensor,
     threshold: float,
     X: torch.Tensor | None = None,
+    stop_before_peel: Callable[[list[int]], bool] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Run the exact 4.1.7 matching-pursuit decisions without feature export."""
     nt = ops["nt"]
@@ -292,6 +296,8 @@ def simulate_matching(
         iX = torch.nonzero(mask)[:, :1]
         peel_counts.append(int(iX.shape[0]))
         if iX.numel() == 0:
+            break
+        if stop_before_peel is not None and stop_before_peel(peel_counts):
             break
         iY = imax[iX]
         amplitude = B[iY, iX] / nm[iY]
@@ -430,6 +436,7 @@ def evaluate_lineage_stage(
     detection_templates: np.ndarray,
 ) -> dict:
     """Apply benchmark unit matching and assign every event a stage status."""
+    import spikeinterface as si
     import spikeinterface.comparison as sc
     from kilosort import CCG
 
@@ -1555,6 +1562,7 @@ def learn_templates(
     recording: si.BaseRecording, output_folder: Path
 ) -> tuple[Path, np.ndarray, dict]:
     from kilosort import template_matching
+    from spikeinterface.sorters.external.kilosort4 import Kilosort4Sorter
 
     sorter_params = json.loads(PARAMS_PATH.read_text())["sorter"]
     sorter_params = copy.deepcopy(sorter_params)
@@ -1605,6 +1613,7 @@ def write_tabular_outputs(outputs: list[dict]) -> None:
 def main() -> None:
     from importlib.metadata import version
     from kilosort import io as ks_io
+    import spikeinterface as si
 
     started = time.perf_counter()
     versions = {

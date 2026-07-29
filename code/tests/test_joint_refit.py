@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 from scipy.optimize import nnls
 from torch.nn.functional import conv1d
 
 from joint_refit import event_gram, refit_block, solve_nonnegative_quadratic
+from peel_stopping import square_root_yield_floor, should_stop_for_low_yield
 from run_joint_refit_diagnostic import (
     run_joint_refit_matching,
     summarize_peel_comparison,
 )
+from run_peel_stopping_diagnostic import run_peel_stopped_matching
+from run_score_diagnostic import simulate_matching
 
 
 def prepare_ctc(U: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
@@ -220,3 +224,72 @@ def test_peel_comparison_reports_exact_and_late_event_deltas() -> None:
     assert rows[2]["event_delta"] == -1
     assert rows[3]["late_event_ratio"] == 0
     assert np.isnan(rows[4]["late_event_ratio"])
+
+
+def test_square_root_yield_stopping_requires_consecutive_low_yield() -> None:
+    assert square_root_yield_floor(484) == 22
+    assert not should_stop_for_low_yield([484, 21, 30, 20, 19])
+    assert should_stop_for_low_yield([484, 30, 22, 20, 19])
+
+
+def test_square_root_yield_stopping_validates_inputs() -> None:
+    with pytest.raises(ValueError, match="first-peel"):
+        square_root_yield_floor(-1)
+    with pytest.raises(ValueError, match="patience"):
+        should_stop_for_low_yield([10], patience=0)
+    with pytest.raises(ValueError, match="peel event"):
+        should_stop_for_low_yield([10, -1, 0])
+
+
+def test_matching_stopping_policy_runs_before_triggering_peel() -> None:
+    U, W, ctc, _, _, design = make_problem()
+    amplitudes = torch.tensor([1.2, 0.6, 1.8, 0.9], dtype=W.dtype)
+    signal = (design @ amplitudes).reshape(5, 64)
+    ops = {"nt": W.shape[1], "wPCA": W, "max_peels": 10}
+    initial = project(signal, U, W)
+
+    baseline = simulate_matching(ops, initial, U, ctc, 0.0, X=signal)
+    no_stop = simulate_matching(
+        ops,
+        initial,
+        U,
+        ctc,
+        0.0,
+        X=signal,
+        stop_before_peel=lambda _: False,
+    )
+    stopped = simulate_matching(
+        ops,
+        initial,
+        U,
+        ctc,
+        0.0,
+        X=signal,
+        stop_before_peel=lambda _: True,
+    )
+
+    for key in ("time", "template", "score", "amplitude", "peel", "Xres"):
+        torch.testing.assert_close(no_stop[key], baseline[key], rtol=0, atol=0)
+    assert stopped["peel_counts"][0] > 0
+    assert stopped["time"].numel() == 0
+    torch.testing.assert_close(stopped["Xres"], signal, rtol=0, atol=0)
+
+
+def test_peel_stopping_wrapper_reports_excluded_triggering_peel() -> None:
+    U, W, ctc, _, _, design = make_problem()
+    signal = (design[:, 0] * 100).reshape(5, 64)
+
+    stopped = run_peel_stopped_matching(
+        {"nt": W.shape[1], "wPCA": W, "max_peels": 10},
+        signal,
+        U,
+        ctc,
+        patience=1,
+    )
+    summary = stopped["stopping_summary"]
+
+    assert summary["stop_triggered"]
+    assert summary["stop_peel"] == 0
+    assert summary["triggering_peel_events"] > 0
+    assert summary["accepted_events"] == 0
+    torch.testing.assert_close(stopped["Xres"], signal, rtol=0, atol=0)

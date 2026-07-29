@@ -231,3 +231,39 @@ Short smoke runs may use `--duration-s` and `--domain`. The registered compariso
 is fixed at 1,200 seconds, both raw-native and denoised-native domains, threshold
 8, one-hop full-`ctc` support, and the solver policy above.
 
+### Experimental peel-aware stopping
+
+The capsule includes a lower-cost GT-blind alternative that leaves Kilosort's
+threshold, scores, amplitudes, and subtraction unchanged but stops a batch's
+matching-pursuit tail after its marginal event yield converges:
+
+```bash
+./run --peel-stopping-diagnostic
+```
+
+For a batch with `N0` candidates on peel 0, the marginal-yield floor is
+`ceil(sqrt(N0))`, the Poisson standard-deviation scale of the initial yield. The
+matcher stops before accepting or subtracting the third consecutive peel at or
+below that floor. Isolated low-yield peels reset the counter. The rule is applied
+independently per batch and uses only candidate counts already computed by the
+unchanged threshold-8 matcher; ground truth is used only by the downstream
+lineage evaluator.
+
+Each run executes an unchanged Kilosort 4.1.7 arm using the identical native
+preprocessing, learned `ops`, templates, binary recording, and batches. The
+`peel_stopping_batch_summary.csv` output records each batch's first-peel count,
+yield floor, evaluated and accepted peels, stop peel, and triggering-peel count.
+`peel_stopping_peel_comparison.csv` reports exact same-template event deltas by
+peel and at-or-after each peel, while the stage, unit, cluster, transition, and
+score tables report both control and stopped lineages.
+
+The square-root rule and patience of three are fixed before evaluation rather
+than tuned against this hybrid ground truth. A count-only replay over the paired
+60-second joint-refit smoke trajectories retained 99.4% of raw and 99.3% of
+denoised candidates while avoiding about 23% of occupied peel iterations. That
+replay is a runtime and scope check, not an accuracy result. Short smoke runs may
+use `--duration-s` and `--domain`; the registered comparison remains 1,200
+seconds, both native domains, learned threshold 8, patience three, and the exact
+same-template baseline control. Use `--skip-baseline-control` only after the
+paired control has been established.
+
