@@ -185,3 +185,39 @@ checked on raw and denoised data. Short smoke runs may use `--duration-s` and
 `--domain`; the registered comparison remains fixed at 1,200 seconds, both
 domains, target FDR 5%, and threshold floor 8.
 
+### Experimental local joint amplitude refit
+
+The capsule also includes a GT-blind matching-pursuit modification that targets
+structured subtraction residuals directly:
+
+```bash
+./run --joint-refit-diagnostic
+```
+
+Detection remains at the native default learned threshold 8. After each original
+greedy subtraction peel, every newly detected event defines a local block
+containing itself and all positive-amplitude events whose center lies within the
+full `ctc` lag support. The matcher solves the nonnegative local problem
+
+```text
+minimize 0.5 * a.T * G * a - b.T * a, subject to a >= 0,
+```
+
+where `G[i, j] = ctc[template_i, template_j, time_i - time_j + nt]` and `b` is
+recovered exactly from the current residual projection plus the block's current
+contribution. Amplitude deltas rebuild both the voltage residual and all template
+projections before the next peel. Overlapping blocks are processed in ascending
+sample order as sequential block-coordinate updates. Identical time-template
+detections share one amplitude variable.
+
+The solver uses an active-set NNLS update, a machine-precision eigenspace rank
+cutoff, and no ridge or ground-truth-derived parameter. Per-batch/per-peel output
+reports greedy and additional refit energy reduction, overlap-block sizes, Gram
+conditioning, rank and convergence safeguards, amplitude changes, zeroed events,
+late-peel counts, and runtime. Ground truth is applied only after extraction by
+the same lineage evaluator used for the baseline diagnostics.
+
+Short smoke runs may use `--duration-s` and `--domain`. The registered comparison
+is fixed at 1,200 seconds, both raw-native and denoised-native domains, threshold
+8, one-hop full-`ctc` support, and the solver policy above.
+

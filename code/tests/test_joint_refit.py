@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import numpy as np
+import torch
+from scipy.optimize import nnls
+from torch.nn.functional import conv1d
+
+from joint_refit import event_gram, refit_block, solve_nonnegative_quadratic
+from run_joint_refit_diagnostic import run_joint_refit_matching
+
+
+def prepare_ctc(U: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+    nt = W.shape[1]
+    WtW = conv1d(
+        W.reshape(-1, 1, nt),
+        W.reshape(-1, 1, nt),
+        padding=nt,
+    )
+    WtW = torch.flip(WtW, [2])
+    UtU = torch.einsum("ikl,jml->ijkm", U, U)
+    return torch.einsum("ijkm,kml->ijl", UtU, WtW)
+
+
+def make_problem() -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    torch.manual_seed(7)
+    dtype = torch.float64
+    nt = 9
+    W = torch.randn(3, nt, dtype=dtype)
+    U = torch.randn(4, 3, 5, dtype=dtype)
+    ctc = prepare_ctc(U, W)
+    times = torch.tensor([20, 24, 31, 45], dtype=torch.int64)
+    templates = torch.tensor([0, 2, 1, 3], dtype=torch.int64)
+    tiwave = torch.arange(-(nt // 2), nt // 2 + 1)
+    atoms = []
+    for event_time, template in zip(times, templates):
+        atom = torch.zeros((5, 64), dtype=dtype)
+        atom[:, event_time + tiwave] = torch.einsum(
+            "jk,jl->kl", U[template], W
+        )
+        atoms.append(atom)
+    design = torch.stack([atom.reshape(-1) for atom in atoms], dim=1)
+    return U, W, ctc, times, templates, design
+
+
+def project(
+    signal: torch.Tensor,
+    U: torch.Tensor,
+    W: torch.Tensor,
+) -> torch.Tensor:
+    projection = conv1d(
+        signal.unsqueeze(1), W.unsqueeze(1), padding=W.shape[1] // 2
+    )
+    return torch.einsum("ijk,kjl->il", U, projection)
+
+
+def test_event_gram_matches_explicit_shifted_waveforms() -> None:
+    _, W, ctc, times, templates, design = make_problem()
+
+    actual = event_gram(ctc, times, templates, W.shape[1])
+
+    torch.testing.assert_close(actual, design.T @ design, rtol=1e-12, atol=1e-10)
+
+
+def test_optimal_amplitudes_leave_residual_unchanged() -> None:
+    U, W, ctc, times, templates, design = make_problem()
+    amplitudes = torch.tensor([1.2, 0.6, 1.8, 0.9], dtype=W.dtype)
+    signal = (design @ amplitudes).reshape(5, 64)
+    residual = signal - (design @ amplitudes).reshape(5, 64)
+
+    refitted, delta, diagnostics = refit_block(
+        project(residual, U, W),
+        ctc,
+        times,
+        templates,
+        amplitudes,
+        W.shape[1],
+    )
+
+    torch.testing.assert_close(refitted, amplitudes, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(delta, torch.zeros_like(delta), rtol=0, atol=1e-12)
+    assert diagnostics["converged"]
+    assert abs(diagnostics["energy_reduction"]) < 1e-20
+
+
+def test_joint_refit_improves_overlapping_residual() -> None:
+    U, W, ctc, times, templates, design = make_problem()
+    true_amplitudes = torch.tensor([1.2, 0.6, 1.8, 0.9], dtype=W.dtype)
+    signal = (design @ true_amplitudes).reshape(5, 64)
+    greedy_amplitudes = torch.tensor([1.0, 0.8, 1.3, 0.7], dtype=W.dtype)
+    residual = signal - (design @ greedy_amplitudes).reshape(5, 64)
+
+    refitted, delta, diagnostics = refit_block(
+        project(residual, U, W),
+        ctc,
+        times,
+        templates,
+        greedy_amplitudes,
+        W.shape[1],
+    )
+    refitted_residual = residual - (design @ delta).reshape(5, 64)
+    reference, _ = nnls(design.numpy(), signal.reshape(-1).numpy())
+
+    np.testing.assert_allclose(refitted.numpy(), reference, rtol=1e-8, atol=1e-9)
+    assert torch.sum(refitted_residual**2) < torch.sum(residual**2)
+    np.testing.assert_allclose(
+        diagnostics["energy_reduction"],
+        float(torch.sum(residual**2) - torch.sum(refitted_residual**2)),
+        rtol=1e-10,
+        atol=1e-10,
+    )
+
+
+def test_negative_unconstrained_amplitude_is_zeroed() -> None:
+    gram = torch.tensor([[2.0, 0.5], [0.5, 1.0]], dtype=torch.float64)
+    rhs = torch.tensor([2.0, -1.0], dtype=torch.float64)
+
+    amplitude, diagnostics = solve_nonnegative_quadratic(
+        gram, rhs, torch.tensor([0.5, 0.5], dtype=torch.float64)
+    )
+
+    torch.testing.assert_close(
+        amplitude, torch.tensor([1.0, 0.0], dtype=torch.float64)
+    )
+    assert diagnostics["converged"]
+    assert torch.all(amplitude >= 0)
+
+
+def test_rank_deficient_duplicate_atoms_are_safe() -> None:
+    gram = torch.tensor([[4.0, 4.0], [4.0, 4.0]], dtype=torch.float64)
+    rhs = torch.tensor([6.0, 6.0], dtype=torch.float64)
+    initial = torch.tensor([1.0, 0.0], dtype=torch.float64)
+    objective_before = 0.5 * initial @ gram @ initial - rhs @ initial
+
+    amplitude, diagnostics = solve_nonnegative_quadratic(gram, rhs, initial)
+    objective_after = 0.5 * amplitude @ gram @ amplitude - rhs @ amplitude
+
+    assert diagnostics["converged"]
+    assert diagnostics["rank"] == 1
+    assert torch.all(amplitude >= 0)
+    torch.testing.assert_close(amplitude.sum(), torch.tensor(1.5, dtype=gram.dtype))
+    assert objective_after <= objective_before
+
+
+def test_matching_loop_preserves_exact_residual_energy_ledger() -> None:
+    torch.manual_seed(11)
+    dtype = torch.float64
+    nt = 9
+    W = torch.randn(2, nt, dtype=dtype)
+    U = torch.randn(3, 2, 4, dtype=dtype)
+    ctc = prepare_ctc(U, W)
+    signal = torch.zeros(4, 256, dtype=dtype)
+    tiwave = torch.arange(-(nt // 2), nt // 2 + 1)
+    for event_time, template, amplitude in (
+        (90, 0, 2.0),
+        (94, 1, 1.7),
+        (180, 2, 1.5),
+    ):
+        signal[:, event_time + tiwave] += amplitude * torch.einsum(
+            "jk,jl->kl", U[template], W
+        )
+
+    result = run_joint_refit_matching(
+        {"nt": nt, "wPCA": W, "max_peels": 10}, signal, U, ctc
+    )
+    summary = result["batch_summary"]
+    relative_audit_error = abs(summary["residual_energy_audit_error"]) / summary[
+        "initial_residual_energy"
+    ]
+
+    assert result["time"].numel() == 3
+    assert torch.all(result["amplitude"] > 0)
+    assert sum(row["overlap_blocks"] for row in result["telemetry_rows"]) > 0
+    assert all(
+        row["refit_energy_reduction"] >= 0
+        for row in result["telemetry_rows"]
+    )
+    assert relative_audit_error < 1e-10
