@@ -9,7 +9,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from event_waveform import paired_waveform_cosine, rank_auc, waveform_shape_metrics
+from event_waveform import (
+    paired_waveform_cosine,
+    quantile_sample_indices,
+    rank_auc,
+    waveform_shape_metrics,
+)
 
 
 SELECTION_PATH = Path(__file__).with_name("event_waveform_selection.json")
@@ -194,6 +199,30 @@ def representative_examples(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def representative_example_gallery(
+    frame: pd.DataFrame, examples_per_class: int = 5
+) -> pd.DataFrame:
+    rows = []
+    evaluation = frame[~frame.reference_tp]
+    for unit_id, unit_frame in evaluation.groupby("gt_unit_id"):
+        for event_class, class_frame in unit_frame.groupby("event_class"):
+            dominant = class_frame[class_frame.dominant_template_event]
+            if not dominant.empty:
+                class_frame = dominant
+            local_indices = quantile_sample_indices(
+                class_frame.denoised_tp_reference_cosine.to_numpy(),
+                examples_per_class,
+            )
+            quantiles = np.linspace(0.1, 0.9, len(local_indices))
+            for quantile, local_index in zip(quantiles, local_indices):
+                selected = class_frame.iloc[local_index]
+                row = selected.to_dict()
+                row["waveform_index"] = int(selected.name)
+                row["shape_quantile"] = float(quantile)
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def plot_trace_band(axis, time_ms, values, event_class: str) -> None:
     median = np.median(values, axis=0)
     low, high = np.quantile(values, (0.1, 0.9), axis=0)
@@ -337,6 +366,94 @@ def plot_examples(
     plt.close(figure)
 
 
+def plot_example_gallery(
+    gallery: pd.DataFrame,
+    waveforms: dict[str, np.ndarray],
+    unit_id: int,
+    output: Path,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    unit_gallery = gallery[gallery.gt_unit_id == unit_id]
+    examples_per_class = int(
+        unit_gallery.groupby("event_class").size().max()
+    )
+    event_classes = [
+        event_class
+        for event_class in ("tp", "fp")
+        if event_class in set(unit_gallery.event_class)
+    ]
+    row_specs = tuple(
+        (event_class, domain)
+        for event_class in event_classes
+        for domain in ("raw", "denoised")
+    )
+    figure, axes = plt.subplots(
+        len(row_specs),
+        examples_per_class,
+        figsize=(3.1 * examples_per_class, 2.4 * len(row_specs)),
+        squeeze=False,
+    )
+    selected_indices = unit_gallery.waveform_index.to_numpy(dtype=np.int64)
+    limits = {
+        domain: float(np.max(np.abs(waveforms[domain][selected_indices])))
+        for domain in ("raw", "denoised")
+    }
+    for row_index, (event_class, domain) in enumerate(row_specs):
+        examples = unit_gallery[unit_gallery.event_class == event_class].sort_values(
+            "shape_quantile"
+        )
+        for column, axis in enumerate(axes[row_index]):
+            if column >= len(examples):
+                axis.axis("off")
+                continue
+            example = examples.iloc[column]
+            waveform = waveforms[domain][int(example.waveform_index)]
+            limit = limits[domain]
+            axis.imshow(
+                waveform,
+                aspect="auto",
+                cmap="RdBu_r",
+                vmin=-limit,
+                vmax=limit,
+                extent=(-1, 1, waveform.shape[0] - 0.5, -0.5),
+            )
+            axis.axvline(0, color="black", linewidth=0.6)
+            if domain == "raw":
+                axis.set_title(
+                    f"{event_class.upper()} q{example.shape_quantile * 100:.0f}\n"
+                    f"score {example.detection_score:.1f}, peel {int(example.detection_peel)}"
+                )
+            else:
+                axis.set_title(
+                    f"cos raw {example.raw_tp_reference_cosine:.2f} | "
+                    f"den {example.denoised_tp_reference_cosine:.2f}"
+                )
+            if column == 0:
+                axis.set_ylabel(
+                    f"{domain} {event_class.upper()}\nlocal channel rank\n"
+                    f"shared +/-{limit:.0f}"
+                )
+            else:
+                axis.set_yticklabels([])
+            if domain == "denoised":
+                axis.set_xlabel("Time (ms)")
+            else:
+                axis.set_xticklabels([])
+    template = int(unit_gallery.detection_template.mode().iloc[0])
+    no_fp = "; no FP events" if "fp" not in event_classes else ""
+    figure.suptitle(
+        f"GT {unit_id}, dominant template {template}: shape-quantile examples{no_fp}",
+        fontsize=16,
+    )
+    figure.tight_layout(rect=(0, 0, 1, 0.96))
+    figure.savefig(output, dpi=180)
+    plt.close(figure)
+
+
 def main() -> None:
     import spikeinterface as si
 
@@ -408,12 +525,16 @@ def main() -> None:
     frame, references = add_shape_metrics(events, waveforms, unit_lookup)
     summary, auc = summarize_metrics(frame)
     examples = representative_examples(frame)
+    gallery = representative_example_gallery(frame)
 
     diagnostic.RESULTS.mkdir(parents=True, exist_ok=True)
     frame.to_csv(diagnostic.RESULTS / "event_waveform_event_metrics.csv", index=False)
     summary.to_csv(diagnostic.RESULTS / "event_waveform_summary.csv", index=False)
     auc.to_csv(diagnostic.RESULTS / "event_waveform_auc.csv", index=False)
     examples.to_csv(diagnostic.RESULTS / "event_waveform_examples.csv", index=False)
+    gallery.to_csv(
+        diagnostic.RESULTS / "event_waveform_example_gallery.csv", index=False
+    )
     reference_arrays = {
         f"unit_{unit_id}_{domain}": value
         for (unit_id, domain), value in references.items()
@@ -439,6 +560,14 @@ def main() -> None:
         waveforms,
         diagnostic.RESULTS / "event_waveform_examples.png",
     )
+    for unit in units:
+        unit_id = unit["gt_unit_id"]
+        plot_example_gallery(
+            gallery,
+            waveforms,
+            unit_id,
+            diagnostic.RESULTS / f"event_waveform_examples_gt{unit_id}.png",
+        )
     manifest = {
         **{key: value for key, value in selection.items() if key != "events"},
         "units": list(unit_lookup.values()),
@@ -461,6 +590,10 @@ def main() -> None:
         "example_policy": (
             "event nearest its held-out class median denoised cosine among dominant-"
             "template events"
+        ),
+        "gallery_policy": (
+            "five dominant-template events per available held-out class nearest "
+            "denoised TP-reference cosine quantiles 0.1 through 0.9"
         ),
         "spikeinterface_version": versions["spikeinterface"],
         "elapsed_s": time.perf_counter() - started,

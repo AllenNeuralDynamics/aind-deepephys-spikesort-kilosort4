@@ -5,6 +5,7 @@ import pytest
 
 from event_waveform import (
     paired_waveform_cosine,
+    quantile_sample_indices,
     rank_auc,
     stratified_sample_indices,
     waveform_shape_metrics,
@@ -55,3 +56,20 @@ def test_paired_waveform_cosine_is_scale_invariant() -> None:
     second = np.array([[[1.0, -1.0, 1.0]], [[0.0, 1.0, 0.0]]])
 
     np.testing.assert_allclose(paired_waveform_cosine(first, second), [1.0, -1.0])
+
+
+def test_quantile_sample_indices_span_ordered_values() -> None:
+    values = np.arange(100, dtype=np.float64)[::-1]
+
+    selected = quantile_sample_indices(values, count=5)
+
+    np.testing.assert_array_equal(values[selected], [10.0, 30.0, 49.0, 69.0, 89.0])
+    assert np.unique(selected).size == 5
+
+
+def test_quantile_sample_indices_return_all_small_inputs() -> None:
+    values = np.array([3.0, 1.0, 2.0])
+
+    selected = quantile_sample_indices(values, count=5)
+
+    np.testing.assert_array_equal(values[selected], [1.0, 2.0, 3.0])

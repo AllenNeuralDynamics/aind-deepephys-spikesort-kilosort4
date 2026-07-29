@@ -53,6 +53,36 @@ def stratified_sample_indices(
     return np.sort(np.asarray(selected, dtype=np.int64))
 
 
+def quantile_sample_indices(
+    values: np.ndarray,
+    count: int,
+    lower_quantile: float = 0.1,
+    upper_quantile: float = 0.9,
+) -> np.ndarray:
+    """Select deterministic examples spanning an ordered value distribution."""
+    values = np.asarray(values)
+    if values.ndim != 1:
+        raise ValueError("values must be a vector")
+    if count <= 0:
+        raise ValueError("count must be positive")
+    if not 0 <= lower_quantile <= upper_quantile <= 1:
+        raise ValueError("quantile bounds must satisfy 0 <= lower <= upper <= 1")
+    order = np.argsort(values, kind="stable")
+    sample_count = min(count, values.size)
+    if not sample_count:
+        return np.empty(0, dtype=np.int64)
+    targets = np.linspace(lower_quantile, upper_quantile, sample_count) * (
+        values.size - 1
+    )
+    available = set(range(values.size))
+    positions = []
+    for target in targets:
+        position = min(available, key=lambda item: (abs(item - target), item))
+        positions.append(position)
+        available.remove(position)
+    return order[np.sort(positions)]
+
+
 def waveform_shape_metrics(
     waveforms: np.ndarray,
     reference: np.ndarray,
