@@ -72,7 +72,7 @@ def target_decoy_threshold(
     negative_scores: torch.Tensor,
     floor: float,
     target_fdr: float,
-) -> tuple[float, float, int, int]:
+) -> tuple[float, float, int, int, int, int]:
     """Choose the minimum knockoff-plus threshold satisfying target FDR."""
     if not 0 < target_fdr < 1:
         raise ValueError(f"target FDR must be in (0, 1): {target_fdr}")
@@ -81,7 +81,7 @@ def target_decoy_threshold(
     positive_count = int(positive.numel())
     negative_count = int(negative.numel())
     if positive_count == 0:
-        return np.inf, np.inf, positive_count, negative_count
+        return np.inf, np.inf, positive_count, negative_count, 0, 0
 
     # Kilosort's original rule is strict (`score > Th_learned`), so the floor
     # candidate excludes scores equal to 8 even though elevated candidates use
@@ -104,13 +104,15 @@ def target_decoy_threshold(
     valid = (targets > 0) & (estimated <= target_fdr)
     accepted_indices = torch.nonzero(valid)
     if accepted_indices.numel() == 0:
-        return np.inf, np.inf, positive_count, negative_count
+        return np.inf, np.inf, positive_count, negative_count, 0, 0
     index = accepted_indices[0, 0]
     return (
         float(candidates[index]),
         float(estimated[index]),
         positive_count,
         negative_count,
+        int(targets[index]),
+        int(decoys[index]),
     )
 
 
@@ -142,13 +144,18 @@ def run_target_decoy_matching(
             B, nm, nt, sign=1
         )
         negative_scores, _, _ = local_peak_scores(B, nm, nt, sign=-1)
-        threshold, estimated_fdr, positive_floor_count, negative_floor_count = (
-            target_decoy_threshold(
-                positive_scores,
-                negative_scores,
-                minimum_threshold,
-                target_fdr,
-            )
+        (
+            threshold,
+            estimated_fdr,
+            positive_floor_count,
+            negative_floor_count,
+            selected_target_count,
+            selected_decoy_count,
+        ) = target_decoy_threshold(
+            positive_scores,
+            negative_scores,
+            minimum_threshold,
+            target_fdr,
         )
         if np.isfinite(threshold):
             if threshold == minimum_threshold:
@@ -176,6 +183,8 @@ def run_target_decoy_matching(
                     if positive_floor_count
                     else np.nan
                 ),
+                "selected_target_count": selected_target_count,
+                "selected_decoy_count": selected_decoy_count,
                 "accepted_events": int(scores.numel()),
                 "positive_score_max": (
                     float(positive_scores.max()) if positive_scores.numel() else np.nan
