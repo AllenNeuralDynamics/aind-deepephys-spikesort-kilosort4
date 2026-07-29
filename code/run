@@ -11,6 +11,11 @@ elif [[ "${1:-}" == "--score-diagnostic-raw-native" ]]; then
 	shift
 	[[ -d ../data/probec_recording1_3 ]]
 	python -u run_raw_native_score_diagnostic.py
+elif [[ "${1:-}" == "--target-decoy-diagnostic" ]]; then
+	shift
+	[[ -d ../data/full96_om1_probec_1200s ]]
+	[[ -d ../data/probec_recording1_3 ]]
+	python -u run_target_decoy_diagnostic.py "$@"
 else
 	python -u run_capsule.py "$@"
 fi

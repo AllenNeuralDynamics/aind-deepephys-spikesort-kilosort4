@@ -153,3 +153,35 @@ as CSV. Comparing this result with the denoised threshold-8 lineage gives the
 native default-baseline comparison; the fixed-template raw replay above answers
 a different controlled transfer question.
 
+### Experimental target-decoy FDR gate
+
+The capsule includes a GT-blind experimental matcher:
+
+```bash
+./run --target-decoy-diagnostic
+```
+
+The registered experiment uses the same first 1,200 seconds of raw and Full96
+omission1 voltage. Each domain independently learns its native channel mask,
+whitening, drift, and templates at the default thresholds. During matching
+pursuit, positive learned-template local maxima are targets and sign-reversed
+local maxima are decoys. For every batch and peel, the matcher chooses the
+smallest threshold at or above 8 satisfying the knockoff-plus estimate
+
+```text
+(1 + decoys above threshold) / targets above threshold <= 0.05.
+```
+
+The `+1` makes the rule conservative and requires at least 20 accepted events
+within a batch/peel at 5% FDR. Ground truth is not used for matching decisions;
+it is applied only afterward for the same lineage evaluation used by the
+baseline diagnostics. The result includes the selected threshold, target/decoy
+counts, estimated FDR, and sign-balance ratio for every batch and peel.
+
+This is a research prototype, not a production recommendation. Its main
+assumption is that negative signed template maxima form an exchangeable null for
+positive residual artifacts after native preprocessing. That assumption must be
+checked on raw and denoised data. Short smoke runs may use `--duration-s` and
+`--domain`; the registered comparison remains fixed at 1,200 seconds, both
+domains, target FDR 5%, and threshold floor 8.
+

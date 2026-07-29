@@ -944,12 +944,15 @@ def run_event_lineage(
             "final_assigned_gt": stages[-1][1]["assigned_gt"].astype(np.int32),
             "final_gt_proximal": stages[-1][1]["gt_proximal"],
         }
+    elif archive_mode == "none":
+        archive = None
     elif archive_mode != "full":
         raise ValueError(f"unsupported event archive mode: {archive_mode}")
     threshold_name = str(threshold).replace(".", "p")
-    np.savez_compressed(
-        RESULTS / f"event_lineage_{domain}_Th_{threshold_name}.npz", **archive
-    )
+    if archive is not None:
+        np.savez_compressed(
+            RESULTS / f"event_lineage_{domain}_Th_{threshold_name}.npz", **archive
+        )
     return {
         "lineage_stages": [result["summary"] for _, result in stages],
         "lineage_units": [
