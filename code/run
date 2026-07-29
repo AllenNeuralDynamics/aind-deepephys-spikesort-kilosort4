@@ -26,6 +26,11 @@ elif [[ "${1:-}" == "--peel-stopping-diagnostic" ]]; then
 	[[ -d ../data/full96_om1_probec_1200s ]]
 	[[ -d ../data/probec_recording1_3 ]]
 	python -u run_peel_stopping_diagnostic.py "$@"
+elif [[ "${1:-}" == "--event-waveform-diagnostic" ]]; then
+	shift
+	[[ -d ../data/full96_om1_probec_1200s ]]
+	[[ -d ../data/probec_recording1_3 ]]
+	python -u run_event_waveform_diagnostic.py "$@"
 else
 	python -u run_capsule.py "$@"
 fi
