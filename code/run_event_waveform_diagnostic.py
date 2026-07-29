@@ -342,18 +342,32 @@ def main() -> None:
     raw_path, denoised_path, _ = diagnostic.discover_inputs()
     raw = si.read_zarr(raw_path)
     denoised = si.load(denoised_path)
+    if raw.get_num_segments() != 1 or denoised.get_num_segments() != 1:
+        raise ValueError("waveform inputs must each have one segment")
     if not np.array_equal(raw.channel_ids, denoised.channel_ids):
         raise ValueError("raw and denoised channel identities differ")
     if raw.get_num_channels() != 384 or denoised.get_num_channels() != 384:
         raise ValueError("selection requires the original 384-channel recordings")
     if not raw.has_scaleable_traces() or not denoised.has_scaleable_traces():
         raise ValueError("source recordings must expose scaled voltage traces")
-    if raw.get_sampling_frequency() != EXPECTED_SAMPLING_FREQUENCY:
+    if not np.isclose(raw.get_sampling_frequency(), EXPECTED_SAMPLING_FREQUENCY):
         raise ValueError(f"unexpected raw sampling frequency: {raw.get_sampling_frequency()}")
-    if denoised.get_sampling_frequency() != EXPECTED_SAMPLING_FREQUENCY:
+    if not np.isclose(
+        denoised.get_sampling_frequency(), EXPECTED_SAMPLING_FREQUENCY
+    ):
         raise ValueError(
             f"unexpected denoised sampling frequency: {denoised.get_sampling_frequency()}"
         )
+    end_frame = int(
+        round(diagnostic.EXPECTED_DURATION_S * EXPECTED_SAMPLING_FREQUENCY)
+    )
+    if raw.get_num_samples() < end_frame:
+        raise ValueError("raw recording is shorter than the analysis interval")
+    raw = raw.frame_slice(0, end_frame)
+    if denoised.get_num_samples() != end_frame:
+        raise ValueError("denoised recording is not exactly 1200 seconds")
+    if max(event["time_sample"] for event in events) + WINDOW_SAMPLES // 2 >= end_frame:
+        raise ValueError("selected event lies outside the analysis interval")
 
     union_indices = sorted(
         {index for unit in units for index in unit["channel_indices"]}
