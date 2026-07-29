@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         default="both",
         help="Domain subset; the registered full experiment uses both.",
     )
+    parser.add_argument(
+        "--skip-baseline-control",
+        action="store_true",
+        help="Skip the unchanged matcher arm that shares the learned native transform.",
+    )
     args = parser.parse_args()
     if args.duration_s <= 0 or args.duration_s > EXPECTED_DURATION_S:
         parser.error(
@@ -80,6 +85,49 @@ def _apply_deltas(
 
 def _quantile(values: list[float], quantile: float) -> float:
     return float(np.quantile(values, quantile)) if values else np.nan
+
+
+def summarize_peel_comparison(
+    baseline_peels: np.ndarray,
+    joint_peels: np.ndarray,
+    max_peels: int,
+    domain: str,
+) -> list[dict]:
+    """Summarize exact same-template baseline and joint-refit event counts."""
+    for label, peels in (("baseline", baseline_peels), ("joint refit", joint_peels)):
+        if np.any((peels < 0) | (peels >= max_peels)):
+            raise ValueError(f"{label} contains a peel outside [0, {max_peels})")
+    baseline_counts = np.bincount(baseline_peels, minlength=max_peels)
+    joint_counts = np.bincount(joint_peels, minlength=max_peels)
+    baseline_late = np.cumsum(baseline_counts[::-1])[::-1]
+    joint_late = np.cumsum(joint_counts[::-1])[::-1]
+    rows = []
+    for peel in range(max_peels):
+        baseline_count = int(baseline_counts[peel])
+        joint_count = int(joint_counts[peel])
+        baseline_remaining = int(baseline_late[peel])
+        joint_remaining = int(joint_late[peel])
+        rows.append(
+            {
+                "domain": domain,
+                "peel": peel,
+                "baseline_events": baseline_count,
+                "joint_refit_events": joint_count,
+                "event_delta": joint_count - baseline_count,
+                "event_ratio": (
+                    joint_count / baseline_count if baseline_count else np.nan
+                ),
+                "baseline_events_at_or_after": baseline_remaining,
+                "joint_refit_events_at_or_after": joint_remaining,
+                "late_event_delta": joint_remaining - baseline_remaining,
+                "late_event_ratio": (
+                    joint_remaining / baseline_remaining
+                    if baseline_remaining
+                    else np.nan
+                ),
+            }
+        )
+    return rows
 
 
 def run_joint_refit_matching(
@@ -435,7 +483,8 @@ def process_domain(
     recording: Any,
     gt: Any,
     device: torch.device,
-) -> tuple[dict, list[dict], list[dict], dict]:
+    include_baseline_control: bool,
+) -> tuple[list[dict], list[dict], list[dict], list[dict], dict]:
     """Learn a native transform, run joint refitting, and evaluate lineage."""
     from kilosort import io as ks_io
     import run_score_diagnostic as diagnostic
@@ -458,6 +507,45 @@ def process_domain(
         filename=str(diagnostic.binary_path(saved)),
         device=device,
     )
+    lineages = []
+    baseline_peels = None
+    baseline_events = None
+    if include_baseline_control:
+        baseline_domain = domain.replace("_joint_refit", "_baseline_control")
+        baseline_ops = ops.copy()
+        baseline_ops["settings"] = ops["settings"].copy()
+        baseline_st, baseline_tF, baseline_ops, baseline_peels = (
+            diagnostic.extract_with_peels(baseline_ops, bfile, U, device)
+        )
+        baseline_events = int(baseline_st.shape[0])
+        baseline_lineage = diagnostic.run_event_lineage(
+            baseline_domain,
+            THRESHOLD,
+            baseline_ops,
+            baseline_st,
+            baseline_tF,
+            baseline_peels,
+            gt,
+            float(ops["fs"]),
+            int(bfile.imin),
+            final_reference=None,
+            archive_mode="none",
+        )
+        diagnostic.write_lineage_checkpoint(
+            baseline_domain,
+            THRESHOLD,
+            baseline_lineage,
+            {
+                "domain": baseline_domain,
+                "Th_learned": THRESHOLD,
+                "algorithm": "unchanged_kilosort_4_1_7_same_template_control",
+            },
+        )
+        lineages.append(baseline_lineage)
+        del baseline_st, baseline_tF
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     refit_ops = ops.copy()
     refit_ops["settings"] = ops["settings"].copy()
     st, tF, refit_ops, peels, telemetry_rows, batch_summaries = (
@@ -486,6 +574,17 @@ def process_domain(
             "algorithm": "one_hop_local_joint_nnls_refit",
         },
     )
+    lineages.append(lineage)
+    peel_comparison_rows = (
+        summarize_peel_comparison(
+            baseline_peels,
+            peels,
+            int(ops["max_peels"]),
+            domain,
+        )
+        if baseline_peels is not None
+        else []
+    )
     for row in telemetry_rows:
         row["domain"] = domain
     for row in batch_summaries:
@@ -497,6 +596,7 @@ def process_domain(
         "kept_channel_ids": kept_ids,
         "removed_channel_ids": removed_ids,
         "templates": int(U.shape[0]),
+        "baseline_control_events": baseline_events,
         "joint_refit_events": int(st.shape[0]),
         "candidate_detections": int(
             sum(row["candidate_detections"] for row in batch_summaries)
@@ -512,7 +612,7 @@ def process_domain(
     shutil.rmtree(saved_folder)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return lineage, telemetry_rows, batch_summaries, metadata
+    return lineages, telemetry_rows, batch_summaries, peel_comparison_rows, metadata
 
 
 def main() -> None:
@@ -560,6 +660,7 @@ def main() -> None:
     outputs = []
     all_telemetry_rows = []
     all_batch_summaries = []
+    all_peel_comparison_rows = []
     domains = []
     recordings = {
         "raw_native_joint_refit": raw,
@@ -571,12 +672,17 @@ def main() -> None:
         "denoised": ("denoised_native_joint_refit",),
     }[args.domain]
     for domain in selected_domains:
-        lineage, telemetry_rows, batch_summaries, metadata = process_domain(
-            domain, recordings[domain], gt, device
+        lineages, telemetry_rows, batch_summaries, peel_comparison_rows, metadata = process_domain(
+            domain,
+            recordings[domain],
+            gt,
+            device,
+            include_baseline_control=not args.skip_baseline_control,
         )
-        outputs.append(lineage)
+        outputs.extend(lineages)
         all_telemetry_rows.extend(telemetry_rows)
         all_batch_summaries.extend(batch_summaries)
+        all_peel_comparison_rows.extend(peel_comparison_rows)
         domains.append(metadata)
 
     for key, filename in (
@@ -600,6 +706,10 @@ def main() -> None:
     pd.DataFrame(all_batch_summaries).to_csv(
         diagnostic.RESULTS / "joint_refit_batch_summary.csv", index=False
     )
+    if all_peel_comparison_rows:
+        pd.DataFrame(all_peel_comparison_rows).to_csv(
+            diagnostic.RESULTS / "joint_refit_peel_comparison.csv", index=False
+        )
     manifest = {
         "algorithm": "one-hop local joint nonnegative amplitude refit",
         "uses_ground_truth_for_decisions": False,
@@ -609,6 +719,11 @@ def main() -> None:
         "solver": "warm-start active-set NNLS with machine-precision eigenspace rank cutoff and no ridge",
         "block_order": "new events in ascending sample order; overlapping blocks are sequential block-coordinate updates",
         "duplicate_policy": "identical time-template atoms share one amplitude variable and can be revived after reaching zero",
+        "baseline_control": (
+            "unchanged Kilosort 4.1.7 extraction using the identical native preprocessing, ops, templates, binary, and batches"
+            if not args.skip_baseline_control
+            else None
+        ),
         "duration_s": args.duration_s,
         "requested_domain": args.domain,
         "registered_full_policy": {
@@ -616,6 +731,7 @@ def main() -> None:
             "domain": "both",
             "Th_learned": THRESHOLD,
             "refit_scope": "one-hop full ctc support",
+            "include_baseline_control": True,
         },
         "sampling_frequency": sampling_frequency,
         "kilosort_version": versions["kilosort"],

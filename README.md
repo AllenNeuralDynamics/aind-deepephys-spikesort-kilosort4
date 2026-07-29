@@ -217,6 +217,13 @@ conditioning, rank and convergence safeguards, amplitude changes, zeroed events,
 late-peel counts, and runtime. Ground truth is applied only after extraction by
 the same lineage evaluator used for the baseline diagnostics.
 
+Each run also executes unchanged Kilosort 4.1.7 with the identical native
+preprocessing, learned `ops`, templates, binary recording, and batch boundaries.
+The stage tables contain both arms, and `joint_refit_peel_comparison.csv` reports
+exact same-template event deltas at each peel and at-or-after each peel. Use
+`--skip-baseline-control` only for mechanism-development runs where that paired
+control has already been established.
+
 Short smoke runs may use `--duration-s` and `--domain`. The registered comparison
 is fixed at 1,200 seconds, both raw-native and denoised-native domains, threshold
 8, one-hop full-`ctc` support, and the solver policy above.

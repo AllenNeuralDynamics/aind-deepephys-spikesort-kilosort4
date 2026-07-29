@@ -6,7 +6,10 @@ from scipy.optimize import nnls
 from torch.nn.functional import conv1d
 
 from joint_refit import event_gram, refit_block, solve_nonnegative_quadratic
-from run_joint_refit_diagnostic import run_joint_refit_matching
+from run_joint_refit_diagnostic import (
+    run_joint_refit_matching,
+    summarize_peel_comparison,
+)
 
 
 def prepare_ctc(U: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
@@ -182,3 +185,21 @@ def test_matching_loop_preserves_exact_residual_energy_ledger() -> None:
         for row in result["telemetry_rows"]
     )
     assert relative_audit_error < 1e-10
+
+
+def test_peel_comparison_reports_exact_and_late_event_deltas() -> None:
+    rows = summarize_peel_comparison(
+        np.array([0, 0, 1, 2, 2, 3]),
+        np.array([0, 0, 1, 2]),
+        max_peels=5,
+        domain="raw_native_joint_refit",
+    )
+
+    assert rows[0]["baseline_events"] == 2
+    assert rows[0]["joint_refit_events"] == 2
+    assert rows[0]["baseline_events_at_or_after"] == 6
+    assert rows[0]["joint_refit_events_at_or_after"] == 4
+    assert rows[0]["late_event_delta"] == -2
+    assert rows[2]["event_delta"] == -1
+    assert rows[3]["late_event_ratio"] == 0
+    assert np.isnan(rows[4]["late_event_ratio"])
