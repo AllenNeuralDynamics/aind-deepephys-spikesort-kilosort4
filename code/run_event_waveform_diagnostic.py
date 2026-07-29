@@ -265,7 +265,8 @@ def plot_overview(
                     )
                     labels.append(f"{domain[:3]}\n{event_class.upper()}")
                     colors.append(COLORS[event_class])
-        boxes = axis.boxplot(box_values, labels=labels, patch_artist=True, showfliers=False)
+        boxes = axis.boxplot(box_values, patch_artist=True, showfliers=False)
+        axis.set_xticks(np.arange(1, len(labels) + 1), labels)
         for patch, color in zip(boxes["boxes"], colors):
             patch.set_facecolor(color)
             patch.set_alpha(0.35)
@@ -292,6 +293,16 @@ def plot_examples(
     if len(units) == 1:
         axes = axes[None, :]
     for row, unit_id in enumerate(units):
+        domain_limits = {}
+        for domain in ("raw", "denoised"):
+            domain_examples = examples[
+                (examples.gt_unit_id == unit_id)
+                & (examples.event_class.isin(("tp", "fp")))
+            ]
+            domain_limits[domain] = max(
+                float(np.max(np.abs(waveforms[domain][int(item.waveform_index)])))
+                for item in domain_examples.itertuples()
+            )
         for column, (domain, event_class) in enumerate(
             (("raw", "tp"), ("raw", "fp"), ("denoised", "tp"), ("denoised", "fp"))
         ):
@@ -305,7 +316,7 @@ def plot_examples(
                 continue
             event_index = int(match.iloc[0].waveform_index)
             waveform = waveforms[domain][event_index]
-            limit = float(np.max(np.abs(waveform)))
+            limit = domain_limits[domain]
             axis.imshow(
                 waveform,
                 aspect="auto",
